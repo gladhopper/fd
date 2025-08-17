@@ -12,8 +12,7 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 
 // IMPORTANT: point to repo file (bundled with Docker image)
-const VIDEO_PATH = path.join(__dirname, 's.mp4');
-
+const VIDEO_PATH = '/app/s.mp4';
 // Performance settings
 const FPS = 6;
 const WIDTH = 160;
