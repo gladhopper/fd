@@ -11,10 +11,10 @@ const PORT = process.env.PORT || 8080;
 const VIDEO_PATH = '/app/s.mp4';
 
 // Configuration
-const FPS = 8; // Target 8 FPS
-const WIDTH = 208; // New resolution
+const FPS = 8;
+const WIDTH = 208;
 const HEIGHT = 156;
-const FRAME_INTERVAL = 1000 / FPS; // 125ms per frame
+const FRAME_INTERVAL = 1000 / FPS; // 125ms
 
 let currentFrame = 0;
 let videoDuration = 0;
@@ -44,7 +44,7 @@ const getVideoDuration = () => {
     
     ffmpeg.ffprobe(VIDEO_PATH, (err, metadata) => {
       if (err) {
-        console.warn('ffprobe failed, using fallback duration');
+        console.warn('ffprobe failed, using fallback duration:', err.message);
         resolve(60);
       } else {
         const duration = metadata.format.duration;
@@ -62,14 +62,14 @@ const getVideoDuration = () => {
     console.log(`🎬 Video loaded: ${videoDuration}s duration, ${FPS} FPS, ${WIDTH}x${HEIGHT}`);
     console.log(`📊 Expected frames: ${Math.floor(videoDuration * FPS)}`);
   } catch (err) {
-    console.error('Duration initialization failed:', err);
+    console.error('Duration initialization failed:', err.message);
     videoDuration = 60;
   }
 })();
 
 // Process management
 let processingTimeout = null;
-let currentFFmpegProcess = null;
+let currentFFmpegCommand = null;
 
 const safeKillProcess = () => {
   if (processingTimeout) {
@@ -77,14 +77,16 @@ const safeKillProcess = () => {
     processingTimeout = null;
   }
   
-  if (currentFFmpegProcess) {
+  if (currentFFmpegCommand) {
     try {
-      currentFFmpegProcess.kill('SIGTERM');
+      currentFFmpegCommand.kill('SIGTERM'); // Use fluent-ffmpeg's kill method
       setTimeout(() => {
         try {
-          currentFFmpegProcess.kill('SIGKILL');
-        } catch (e) {}
-        currentFFmpegProcess = null;
+          currentFFmpegCommand.kill('SIGKILL'); // Force kill if needed
+        } catch (e) {
+          console.warn('Force kill error:', e.message);
+        }
+        currentFFmpegCommand = null;
       }, 500);
     } catch (e) {
       console.warn('Process cleanup error:', e.message);
@@ -100,7 +102,7 @@ const processFrame = async () => {
   const seekTime = currentFrame / FPS;
 
   if (seekTime >= videoDuration || !isFinite(seekTime)) {
-    currentFrame = 0; // Loop back to start
+    currentFrame = 0;
     isProcessing = false;
     setTimeout(processFrame, FRAME_INTERVAL);
     return;
@@ -113,7 +115,7 @@ const processFrame = async () => {
     isProcessing = false;
     currentFrame = (currentFrame + 1) % Math.floor(videoDuration * FPS);
     setTimeout(processFrame, FRAME_INTERVAL);
-  }, 1500);
+  }, 3000); // Increased timeout
 
   let pixelBuffer = Buffer.alloc(0);
   const outputStream = new PassThrough();
@@ -143,12 +145,12 @@ const processFrame = async () => {
       totalFramesProcessed++;
       consecutiveErrors = Math.max(0, consecutiveErrors - 1);
       isProcessing = false;
-      currentFFmpegProcess = null;
+      currentFFmpegCommand = null;
 
       const processingTime = Date.now() - frameStart;
       avgProcessingTime = (avgProcessingTime * 0.9) + (processingTime * 0.1);
 
-      if (totalFramesProcessed % 8 === 0) { // Log every 1s (8 frames)
+      if (totalFramesProcessed % 8 === 0) {
         console.log(`✅ Frame ${lastSuccessfulFrame}: ${processingTime}ms (avg: ${Math.round(avgProcessingTime)}ms)`);
       }
 
@@ -156,7 +158,7 @@ const processFrame = async () => {
       const nextDelay = Math.max(0, FRAME_INTERVAL - elapsed);
       setTimeout(processFrame, nextDelay);
     } catch (err) {
-      console.error('Success handler error:', err);
+      console.error('Success handler error:', err.message);
       isProcessing = false;
       setTimeout(processFrame, FRAME_INTERVAL);
     }
@@ -186,8 +188,9 @@ const processFrame = async () => {
   }
 
   try {
-    currentFFmpegProcess = ffmpeg(VIDEO_PATH)
+    currentFFmpegCommand = ffmpeg(VIDEO_PATH)
       .seekInput(seekTime)
+      .inputOptions(['-r 8']) // Force input frame rate
       .frames(1)
       .size(`${WIDTH}x${HEIGHT}`)
       .outputOptions([
@@ -195,6 +198,7 @@ const processFrame = async () => {
         '-vf', `scale=${WIDTH}:${HEIGHT}:flags=fast_bilinear`,
         '-preset ultrafast',
         '-tune zerolatency',
+        '-threads 1', // Single-thread for stability
         '-an',
         '-sn',
         '-dn'
