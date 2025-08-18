@@ -136,15 +136,23 @@ const processSynchronizedFrame = async (targetTime) => {
     
     // Set up timeout for the stream
     const streamTimeout = setTimeout(() => {
-      console.log('⚠️ Stream timeout, killing FFmpeg process');
-      if (activeFFmpegProcess) {
-        activeFFmpegProcess.kill('SIGKILL');
+      console.log('⚠️ Stream timeout, destroying stream');
+      try {
+        if (outputStream && !outputStream.destroyed) {
+          outputStream.destroy();
+        }
+        if (activeFFmpegProcess) {
+          // Use the fluent-ffmpeg kill method
+          activeFFmpegProcess.kill();
+        }
+      } catch (err) {
+        console.log('Error during timeout cleanup:', err.message);
       }
-      outputStream.destroy();
       consecutiveErrors++;
       isProcessing = false;
+      activeFFmpegProcess = null;
       resolve(null);
-    }, 3000); // 3 second timeout
+    }, 2500); // Reduced to 2.5 seconds
     
     outputStream.on('data', chunk => {
       pixelBuffer = Buffer.concat([pixelBuffer, chunk]);
@@ -355,17 +363,25 @@ app.get('/', (req, res) => {
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
-  console.log('Shutting down...');
-  if (activeFFmpegProcess) {
-    activeFFmpegProcess.kill('SIGTERM');
+  console.log('Shutting down gracefully...');
+  try {
+    if (activeFFmpegProcess) {
+      activeFFmpegProcess.kill();
+    }
+  } catch (err) {
+    console.log('Error during shutdown:', err.message);
   }
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
-  console.log('Shutting down...');
-  if (activeFFmpegProcess) {
-    activeFFmpegProcess.kill('SIGTERM');
+  console.log('Shutting down gracefully...');
+  try {
+    if (activeFFmpegProcess) {
+      activeFFmpegProcess.kill();
+    }
+  } catch (err) {
+    console.log('Error during shutdown:', err.message);
   }
   process.exit(0);
 });
