@@ -20,6 +20,7 @@ let currentFrame = 0;
 let videoDuration = 0;
 let lastPixels = [];
 let isProcessing = false;
+let frameBuffer = []; // Buffer up to 3 frames
 
 // Performance tracking
 let avgProcessingTime = 100;
@@ -79,10 +80,10 @@ const safeKillProcess = () => {
   
   if (currentFFmpegCommand) {
     try {
-      currentFFmpegCommand.kill('SIGTERM'); // Use fluent-ffmpeg's kill method
+      currentFFmpegCommand.kill('SIGTERM');
       setTimeout(() => {
         try {
-          currentFFmpegCommand.kill('SIGKILL'); // Force kill if needed
+          currentFFmpegCommand.kill('SIGKILL');
         } catch (e) {
           console.warn('Force kill error:', e.message);
         }
@@ -95,7 +96,7 @@ const safeKillProcess = () => {
 };
 
 // Frame processing
-const processFrame = async () => {
+const processFrame = async (retryCount = 0) => {
   if (isProcessing) return;
   isProcessing = true;
   const frameStart = Date.now();
@@ -109,13 +110,17 @@ const processFrame = async () => {
   }
 
   processingTimeout = setTimeout(() => {
-    console.warn(`⏰ Frame ${currentFrame} timeout (${seekTime.toFixed(2)}s)`);
+    console.warn(`⏰ Frame ${currentFrame} timeout (${seekTime.toFixed(2)}s, retry ${retryCount})`);
     safeKillProcess();
     consecutiveErrors++;
     isProcessing = false;
-    currentFrame = (currentFrame + 1) % Math.floor(videoDuration * FPS);
-    setTimeout(processFrame, FRAME_INTERVAL);
-  }, 3000); // Increased timeout
+    if (retryCount < 2) {
+      setTimeout(() => processFrame(retryCount + 1), 100);
+    } else {
+      currentFrame = (currentFrame + 1) % Math.floor(videoDuration * FPS);
+      setTimeout(processFrame, FRAME_INTERVAL);
+    }
+  }, 3000);
 
   let pixelBuffer = Buffer.alloc(0);
   const outputStream = new PassThrough();
@@ -139,6 +144,8 @@ const processFrame = async () => {
         pixels.push([pixelBuffer[i] || 0, pixelBuffer[i + 1] || 0, pixelBuffer[i + 2] || 0]);
       }
 
+      frameBuffer.push({ pixels, frame: currentFrame });
+      if (frameBuffer.length > 3) frameBuffer.shift(); // Keep 3 frames
       lastPixels = pixels;
       lastSuccessfulFrame = currentFrame;
       currentFrame = (currentFrame + 1) % Math.floor(videoDuration * FPS);
@@ -150,7 +157,7 @@ const processFrame = async () => {
       const processingTime = Date.now() - frameStart;
       avgProcessingTime = (avgProcessingTime * 0.9) + (processingTime * 0.1);
 
-      if (totalFramesProcessed % 8 === 0) {
+      if (totalFramesProcessed % 4 === 0) {
         console.log(`✅ Frame ${lastSuccessfulFrame}: ${processingTime}ms (avg: ${Math.round(avgProcessingTime)}ms)`);
       }
 
@@ -168,11 +175,15 @@ const processFrame = async () => {
     if (streamEnded) return;
     streamEnded = true;
     safeKillProcess();
-    console.error(`💥 FFmpeg error at frame ${currentFrame} (${seekTime.toFixed(2)}s):`, err.message);
+    console.error(`💥 FFmpeg error at frame ${currentFrame} (${seekTime.toFixed(2)}s, retry ${retryCount}):`, err.message);
     consecutiveErrors++;
     isProcessing = false;
-    currentFrame = (currentFrame + 1) % Math.floor(videoDuration * FPS);
-    setTimeout(processFrame, FRAME_INTERVAL);
+    if (retryCount < 2) {
+      setTimeout(() => processFrame(retryCount + 1), 100);
+    } else {
+      currentFrame = (currentFrame + 1) % Math.floor(videoDuration * FPS);
+      setTimeout(processFrame, FRAME_INTERVAL);
+    }
   };
 
   outputStream.on('data', chunk => {
@@ -190,7 +201,7 @@ const processFrame = async () => {
   try {
     currentFFmpegCommand = ffmpeg(VIDEO_PATH)
       .seekInput(seekTime)
-      .inputOptions(['-r 8']) // Force input frame rate
+      .inputOptions(['-r 8', '-vsync 0'])
       .frames(1)
       .size(`${WIDTH}x${HEIGHT}`)
       .outputOptions([
@@ -198,7 +209,7 @@ const processFrame = async () => {
         '-vf', `scale=${WIDTH}:${HEIGHT}:flags=fast_bilinear`,
         '-preset ultrafast',
         '-tune zerolatency',
-        '-threads 1', // Single-thread for stability
+        '-threads 1',
         '-an',
         '-sn',
         '-dn'
@@ -230,10 +241,11 @@ process.on('exit', cleanup);
 // API endpoints
 app.get('/frame', (req, res) => {
   res.header('Cache-Control', 'no-cache, no-store, must-revalidate');
+  const frameData = frameBuffer.length > 0 ? frameBuffer[0] : { pixels: lastPixels, frame: lastSuccessfulFrame };
   res.json({
-    pixels: lastPixels,
-    frame: lastSuccessfulFrame,
-    timestamp: lastSuccessfulFrame / FPS,
+    pixels: frameData.pixels,
+    frame: frameData.frame,
+    timestamp: frameData.frame / FPS,
     width: WIDTH,
     height: HEIGHT,
     avgProcessingTime: Math.round(avgProcessingTime)
@@ -253,7 +265,8 @@ app.get('/info', (req, res) => {
     avgProcessingTime: Math.round(avgProcessingTime),
     totalFramesProcessed,
     consecutiveErrors,
-    lastSuccessfulFrame
+    lastSuccessfulFrame,
+    bufferSize: frameBuffer.length
   });
 });
 
@@ -267,6 +280,7 @@ app.get('/health', (req, res) => {
     isProcessing,
     fileExists: fs.existsSync(VIDEO_PATH),
     lastSuccessfulFrame,
+    bufferSize: frameBuffer.length,
     uptime: process.uptime()
   });
 });
