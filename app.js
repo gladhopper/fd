@@ -11,7 +11,7 @@ ffmpeg.setFfprobePath('/usr/bin/ffprobe');
 const app = express();
 const PORT = process.env.PORT || 8000;
 
-// IMPORTANT: point to repo file (bundled with Docker image)
+// Point to video file (bundled with Docker image)
 const VIDEO_PATH = '/app/s.mp4';
 
 // ENHANCED DEBUGGING BLOCK
@@ -20,7 +20,6 @@ console.log('Current working directory:', process.cwd());
 console.log('VIDEO_PATH:', VIDEO_PATH);
 
 try {
-  // More comprehensive file system check
   console.log('All files in /app:', fs.readdirSync('/app'));
   console.log('Does VIDEO_PATH exist?', fs.existsSync(VIDEO_PATH));
   
@@ -30,7 +29,6 @@ try {
     console.log('File permissions:', stats.mode.toString(8));
     console.log('Is readable:', fs.constants.R_OK & stats.mode);
     
-    // Test file integrity
     try {
       const testBuffer = fs.readFileSync(VIDEO_PATH, { flag: 'r', highWaterMark: 1024 });
       console.log('File header (first 32 bytes):', testBuffer.slice(0, 32).toString('hex'));
@@ -40,7 +38,6 @@ try {
     }
   }
   
-  // Check for alternative file locations
   const alternatives = ['/app/s.mp4', './s.mp4', 's.mp4'];
   alternatives.forEach(alt => {
     if (fs.existsSync(alt)) {
@@ -53,7 +50,7 @@ try {
 }
 console.log('=== END ENHANCED DEBUG ===');
 
-// FIXED QUALITY SETTINGS - All output 160x120 for Roblox client compatibility
+// FIXED QUALITY SETTINGS - All output 160x120 for Roblox compatibility
 const QUALITY_PROFILES = {
   low: { width: 160, height: 120, fps: 8, preset: 'ultrafast' },
   medium: { width: 160, height: 120, fps: 10, preset: 'veryfast' },
@@ -61,12 +58,13 @@ const QUALITY_PROFILES = {
   ultra: { width: 160, height: 120, fps: 15, preset: 'medium' }
 };
 
-let currentProfile = 'low'; // Start with low quality to prevent timeouts
+// Start with medium quality to reduce initial resource load
+let currentProfile = 'medium';
 let { width: WIDTH, height: HEIGHT, fps: FPS, preset: PRESET } = QUALITY_PROFILES[currentProfile];
+let FRAME_INTERVAL = 1000 / FPS;
 
-const FRAME_INTERVAL = 1000 / FPS;
 const MAX_CONSECUTIVE_ERRORS = 5;
-const QUALITY_ADJUSTMENT_THRESHOLD = 10; // Adjust quality after N errors
+const QUALITY_ADJUSTMENT_THRESHOLD = 5; // Lowered to trigger downgrades sooner
 
 // ENHANCED SYNCHRONIZATION
 const VIDEO_START_OFFSET = parseFloat(process.env.VIDEO_START_OFFSET || 0);
@@ -83,8 +81,19 @@ let qualityAdjustmentTimer = 0;
 const performanceStats = {
   avgProcessingTime: 0,
   successRate: 0,
-  lastSuccessTime: 0
+  lastSuccessTime: 0,
+  memoryUsage: null,
+  cpuUsage: null
 };
+
+// Handle SIGTERM for graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('🛑 Received SIGTERM, cleaning up...');
+  if (ffmpegInstance) {
+    ffmpegInstance.kill('SIGTERM');
+  }
+  process.exit(0);
+});
 
 // CORS with enhanced headers
 app.use((req, res, next) => {
@@ -108,7 +117,7 @@ const getVideoDuration = () => {
     const timeoutId = setTimeout(() => {
       console.warn('⚠️ ffprobe timeout, using fallback');
       resolve(300);
-    }, 10000); // 10 second timeout
+    }, 10000);
     
     ffmpeg.ffprobe(VIDEO_PATH, (err, metadata) => {
       clearTimeout(timeoutId);
@@ -147,11 +156,13 @@ const adjustQuality = (direction) => {
   HEIGHT = profile.height;
   FPS = profile.fps;
   PRESET = profile.preset;
+  FRAME_INTERVAL = 1000 / FPS; // Update FRAME_INTERVAL
   
   console.log(`🎥 New settings: ${WIDTH}x${HEIGHT} @ ${FPS}fps (${PRESET})`);
 };
 
-// ENHANCED frame processing with better error handling and quality optimization
+// ENHANCED frame processing with better error handling and optimization
+let ffmpegInstance = null; // Track FFmpeg instance for cleanup
 const processSingleFrame = async (targetTime) => {
   return new Promise((resolve) => {
     console.log(`🎬 Processing frame at ${targetTime.toFixed(2)}s (${currentProfile})`);
@@ -160,11 +171,10 @@ const processSingleFrame = async (targetTime) => {
     let pixelBuffer = Buffer.alloc(0);
     let outputStream = null;
     let streamEnded = false;
-    let ffmpegInstance = null;
     
-    // Reduced timeout for 160x120 resolution
-    const timeout = currentProfile === 'ultra' ? 2000 : 
-                   currentProfile === 'high' ? 1500 : 1000;
+    // Dynamic timeout based on quality profile
+    const timeout = currentProfile === 'ultra' ? 3000 : 
+                   currentProfile === 'high' ? 2000 : 1500;
     
     const streamTimeout = setTimeout(() => {
       if (!streamEnded) {
@@ -187,13 +197,13 @@ const processSingleFrame = async (targetTime) => {
         try {
           ffmpegInstance.kill('SIGTERM');
         } catch (e) {
-          // Ignore kill errors
+          console.error('Error killing FFmpeg:', e.message);
         }
+        ffmpegInstance = null;
       }
     };
     
     try {
-      // Pre-flight checks
       if (!fs.existsSync(VIDEO_PATH)) {
         console.error('❌ Video file missing during processing');
         cleanup();
@@ -216,7 +226,6 @@ const processSingleFrame = async (targetTime) => {
         const processingTime = Date.now() - startTime;
         
         try {
-          // Enhanced pixel processing with validation
           const expectedSize = WIDTH * HEIGHT * 3;
           if (pixelBuffer.length !== expectedSize) {
             console.warn(`⚠️ Buffer size mismatch: got ${pixelBuffer.length}, expected ${expectedSize}`);
@@ -224,7 +233,6 @@ const processSingleFrame = async (targetTime) => {
           
           const pixels = [];
           for (let i = 0; i < Math.min(pixelBuffer.length, expectedSize); i += 3) {
-            // Add bounds checking
             if (i + 2 < pixelBuffer.length) {
               pixels.push([
                 pixelBuffer[i] || 0,
@@ -236,7 +244,6 @@ const processSingleFrame = async (targetTime) => {
           
           console.log(`✅ Frame at ${targetTime.toFixed(2)}s: ${pixels.length} pixels (${processingTime}ms)`);
           
-          // Track performance
           lastProcessingTimes.push(processingTime);
           if (lastProcessingTimes.length > 10) {
             lastProcessingTimes.shift();
@@ -256,7 +263,6 @@ const processSingleFrame = async (targetTime) => {
         resolve(null);
       });
       
-      // ENHANCED FFmpeg configuration with better stability
       ffmpegInstance = ffmpeg(VIDEO_PATH)
         .seekInput(Math.max(0, targetTime))
         .frames(1)
@@ -265,24 +271,22 @@ const processSingleFrame = async (targetTime) => {
           '-pix_fmt rgb24',
           `-preset ${PRESET}`,
           '-tune fastdecode',
-          '-threads 1', // Reduced threads for stability
+          '-threads 1',
           '-avoid_negative_ts make_zero',
-          '-fflags +genpts+discardcorrupt', // Handle corrupt frames better
-          '-err_detect ignore_err', // Continue on minor errors
+          '-fflags +genpts+discardcorrupt',
           '-f rawvideo'
         ])
         .format('rawvideo')
         .on('start', (cmd) => {
-          // Optional: log FFmpeg command for debugging
-          // console.log('FFmpeg command:', cmd);
+          console.log('FFmpeg command:', cmd); // Log for debugging
         })
-        .on('error', (err) => {
+        .on('error', (err, stdout, stderr) => {
           cleanup();
-          console.error(`❌ FFmpeg error at ${targetTime.toFixed(2)}s:`, err.message.split('\n')[0]);
+          console.error(`❌ FFmpeg error at ${targetTime.toFixed(2)}s:`, err.message);
+          console.error('FFmpeg stderr:', stderr);
           resolve(null);
         })
         .on('stderr', (stderrLine) => {
-          // Only log critical errors
           if (stderrLine.includes('error') || stderrLine.includes('failed')) {
             console.warn('FFmpeg stderr:', stderrLine);
           }
@@ -310,7 +314,6 @@ const processSingleFrame = async (targetTime) => {
       console.log(`⏩ Video offset: ${VIDEO_START_OFFSET}s`);
     }
     
-    // Start processing loop
     startProcessingLoop();
     
   } catch (err) {
@@ -338,26 +341,30 @@ let lastSuccessfulTime = -1;
 const processFrameLoop = async () => {
   if (!videoDuration || isProcessing) return;
   
-  // Smart error recovery with quality adjustment
-  if (consecutiveErrors > QUALITY_ADJUSTMENT_THRESHOLD) {
-    adjustQuality('down');
-    consecutiveErrors = Math.floor(consecutiveErrors / 2); // Reduce error count after downgrade
-  }
+  // Monitor resources
+  performanceStats.memoryUsage = process.memoryUsage();
+  performanceStats.cpuUsage = process.cpuUsage();
   
-  // Pause on too many errors
-  if (consecutiveErrors > MAX_CONSECUTIVE_ERRORS) {
+  // Force downgrade on excessive errors
+  if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+    adjustQuality('down');
+    consecutiveErrors = 0;
     const pauseTime = Math.min(consecutiveErrors * 1000, 8000);
     console.log(`⏸️ Pausing for ${pauseTime/1000}s due to errors`);
     await new Promise(resolve => setTimeout(resolve, pauseTime));
-    consecutiveErrors = Math.max(0, consecutiveErrors - 2);
     return;
+  }
+  
+  // Downgrade on high resource usage
+  if (performanceStats.memoryUsage && performanceStats.memoryUsage.heapUsed > 200 * 1024 * 1024) { // 200MB threshold
+    adjustQuality('down');
+    console.log('📉 Downgraded due to high memory usage');
   }
   
   isProcessing = true;
   const currentTime = getCurrentVideoTime();
   
-  // Skip duplicate frames
-  if (Math.abs(currentTime - lastSuccessfulTime) < (1 / FPS / 2)) {
+  if (Math.abs(currentTime - lastSuccessfulTime) < (1 / FPS)) {
     isProcessing = false;
     return;
   }
@@ -371,15 +378,12 @@ const processFrameLoop = async () => {
     totalFramesProcessed++;
     performanceStats.lastSuccessTime = Date.now();
     
-    // Calculate success rate
     performanceStats.successRate = totalFramesProcessed / (totalFramesProcessed + totalErrors);
     
-    // Calculate average processing time
     if (lastProcessingTimes.length > 0) {
       performanceStats.avgProcessingTime = lastProcessingTimes.reduce((a, b) => a + b, 0) / lastProcessingTimes.length;
     }
     
-    // Consider quality upgrade if performance is good
     qualityAdjustmentTimer++;
     if (qualityAdjustmentTimer > 50 && performanceStats.avgProcessingTime < 300 && consecutiveErrors === 0) {
       adjustQuality('up');
@@ -465,6 +469,7 @@ app.get('/quality/:profile', (req, res) => {
     HEIGHT = settings.height;
     FPS = settings.fps;
     PRESET = settings.preset;
+    FRAME_INTERVAL = 1000 / FPS;
     
     console.log(`🎛️ Quality manually set to: ${currentProfile}`);
     res.json({ success: true, quality: currentProfile, settings });
@@ -511,7 +516,7 @@ app.get('/', (req, res) => {
   });
 });
 
-// Health check endpoint
+// Health check endpoint with resource monitoring
 app.get('/health', (req, res) => {
   const isHealthy = fs.existsSync(VIDEO_PATH) && 
                    consecutiveErrors < MAX_CONSECUTIVE_ERRORS &&
@@ -523,7 +528,9 @@ app.get('/health', (req, res) => {
       fileExists: fs.existsSync(VIDEO_PATH),
       errorsUnderControl: consecutiveErrors < MAX_CONSECUTIVE_ERRORS,
       videoDurationKnown: videoDuration > 0,
-      recentSuccess: (Date.now() - performanceStats.lastSuccessTime) < 30000
+      recentSuccess: (Date.now() - performanceStats.lastSuccessTime) < 30000,
+      memoryUsage: process.memoryUsage(),
+      cpuUsage: process.cpuUsage()
     }
   });
 });
