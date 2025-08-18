@@ -44,32 +44,34 @@ let ffmpegInstance = null;
 
 // Validate and get video duration
 async function getVideoDuration(videoPath) {
-  return new Promise((resolve) => {
-    if (!fs.existsSync(videoPath)) {
-      console.error(`❌ Video file not found: ${videoPath}`);
-      resolve(300);
-      return;
-    }
-    ffmpeg.ffprobe(videoPath, (err, metadata) => {
-      if (err) {
-        console.warn(`⚠️ ffprobe failed for ${videoPath}:`, err.message);
-        resolve(300);
-      } else {
-        const duration = metadata.format.duration || 300;
-        console.log(`✅ Video duration for ${videoPath}: ${duration}s`);
-        resolve(duration);
-      }
+  try {
+    await fs.access(videoPath); // Check if file exists
+    return new Promise((resolve) => {
+      ffmpeg.ffprobe(videoPath, (err, metadata) => {
+        if (err) {
+          console.warn(`⚠️ ffprobe failed for ${videoPath}:`, err.message);
+          resolve(300);
+        } else {
+          const duration = metadata.format.duration || 300;
+          console.log(`✅ Video duration for ${videoPath}: ${duration}s`);
+          resolve(duration);
+        }
+      });
     });
-  });
+  } catch (err) {
+    console.error(`❌ Video file not found: ${videoPath}`);
+    return 300;
+  }
 }
 
 // Initialize video durations
 (async () => {
   try {
     for (const [videoName, videoPath] of Object.entries(VIDEO_FILES)) {
-      if (await fs.access(videoPath).then(() => true).catch(() => false)) {
+      try {
+        await fs.access(videoPath);
         videoDurations[videoName] = await getVideoDuration(videoPath);
-      } else {
+      } catch (err) {
         console.warn(`⚠️ Video file ${videoName} not found at ${videoPath}`);
         videoDurations[videoName] = 300;
       }
@@ -115,81 +117,77 @@ const processSingleFrame = async (targetTime, videoName) => {
       }
     };
 
-    try {
-      if (!fs.existsSync(videoPath)) {
+    (async () => {
+      try {
+        await fs.access(videoPath);
+        outputStream.on('data', chunk => {
+          if (!streamEnded) pixelBuffer = Buffer.concat([pixelBuffer, chunk]);
+        });
+
+        outputStream.on('end', () => {
+          if (streamEnded) return;
+          cleanup();
+          const processingTime = Date.now() - startTime;
+          try {
+            const expectedSize = WIDTH * HEIGHT * 3;
+            if (pixelBuffer.length !== expectedSize) {
+              console.warn(`⚠️ Buffer size mismatch: got ${pixelBuffer.length}, expected ${expectedSize}`);
+            }
+            const pixels = [];
+            for (let i = 0; i < Math.min(pixelBuffer.length, expectedSize); i += 3) {
+              if (i + 2 < pixelBuffer.length) {
+                pixels.push([
+                  pixelBuffer[i] || 0,
+                  pixelBuffer[i + 1] || 0,
+                  pixelBuffer[i + 2] || 0
+                ]);
+              }
+            }
+            console.log(`✅ Frame at ${targetTime.toFixed(2)}s: ${pixels.length} pixels (${processingTime}ms)`);
+            lastProcessingTimes.push(processingTime);
+            if (lastProcessingTimes.length > 10) lastProcessingTimes.shift();
+            resolve(pixels);
+          } catch (err) {
+            console.error('❌ Pixel processing error:', err.message);
+            resolve(null);
+          }
+        });
+
+        outputStream.on('error', (err) => {
+          cleanup();
+          console.error(`❌ Stream error at ${targetTime.toFixed(2)}s:`, err.message);
+          resolve(null);
+        });
+
+        ffmpegInstance = ffmpeg(videoPath)
+          .seekInput(Math.max(0, targetTime))
+          .frames(1)
+          .size(`${WIDTH}x${HEIGHT}`)
+          .outputOptions([
+            '-pix_fmt rgb24',
+            `-preset ${PRESET}`,
+            '-tune fastdecode',
+            '-threads 1',
+            '-re',
+            '-avoid_negative_ts make_zero',
+            '-fflags +genpts+discardcorrupt',
+            '-f rawvideo'
+          ])
+          .format('rawvideo')
+          .on('start', (cmd) => console.log('FFmpeg command:', cmd))
+          .on('error', (err, stdout, stderr) => {
+            cleanup();
+            console.error(`❌ FFmpeg error at ${targetTime.toFixed(2)}s:`, err.message);
+            console.error('FFmpeg stderr:', stderr);
+            resolve(null);
+          })
+          .pipe(outputStream, { end: true });
+      } catch (err) {
         console.error(`❌ Video file missing: ${videoPath}`);
         cleanup();
         resolve(null);
-        return;
       }
-
-      outputStream.on('data', chunk => {
-        if (!streamEnded) pixelBuffer = Buffer.concat([pixelBuffer, chunk]);
-      });
-
-      outputStream.on('end', () => {
-        if (streamEnded) return;
-        cleanup();
-        const processingTime = Date.now() - startTime;
-        try {
-          const expectedSize = WIDTH * HEIGHT * 3;
-          if (pixelBuffer.length !== expectedSize) {
-            console.warn(`⚠️ Buffer size mismatch: got ${pixelBuffer.length}, expected ${expectedSize}`);
-          }
-          const pixels = [];
-          for (let i = 0; i < Math.min(pixelBuffer.length, expectedSize); i += 3) {
-            if (i + 2 < pixelBuffer.length) {
-              pixels.push([
-                pixelBuffer[i] || 0,
-                pixelBuffer[i + 1] || 0,
-                pixelBuffer[i + 2] || 0
-              ]);
-            }
-          }
-          console.log(`✅ Frame at ${targetTime.toFixed(2)}s: ${pixels.length} pixels (${processingTime}ms)`);
-          lastProcessingTimes.push(processingTime);
-          if (lastProcessingTimes.length > 10) lastProcessingTimes.shift();
-          resolve(pixels);
-        } catch (err) {
-          console.error('❌ Pixel processing error:', err.message);
-          resolve(null);
-        }
-      });
-
-      outputStream.on('error', (err) => {
-        cleanup();
-        console.error(`❌ Stream error at ${targetTime.toFixed(2)}s:`, err.message);
-        resolve(null);
-      });
-
-      ffmpegInstance = ffmpeg(videoPath)
-        .seekInput(Math.max(0, targetTime))
-        .frames(1)
-        .size(`${WIDTH}x${HEIGHT}`)
-        .outputOptions([
-          '-pix_fmt rgb24',
-          `-preset ${PRESET}`,
-          '-tune fastdecode',
-          '-threads 1',
-          '-re',
-          '-avoid_negative_ts make_zero',
-          '-fflags +genpts+discardcorrupt',
-          '-f rawvideo'
-        ])
-        .format('rawvideo')
-        .on('start', (cmd) => console.log('FFmpeg command:', cmd))
-        .on('error', (err, stdout, stderr) => {
-          cleanup();
-          console.error(`❌ FFmpeg error at ${targetTime.toFixed(2)}s:`, err.message);
-          console.error('FFmpeg stderr:', stderr);
-          resolve(null);
-        })
-        .pipe(outputStream, { end: true });
-    } catch (err) {
-      cleanup();
-      console.error('❌ Failed to create FFmpeg process:', err.message);
-      resolve(null);
-    }
+    })();
   });
 };
 
@@ -287,13 +285,18 @@ app.get('/sync', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  const isHealthy = Object.values(VIDEO_FILES).some(path => fs.existsSync(path)) &&
+  const isHealthy = Object.keys(videoDurations).length > 0 &&
                     consecutiveErrors < MAX_CONSECUTIVE_ERRORS &&
-                    Object.keys(videoDurations).length > 0;
+                    performanceStats.lastSuccessTime > 0;
   res.status(isHealthy ? 200 : 503).json({
     status: isHealthy ? 'healthy' : 'unhealthy',
     checks: {
-      videosExist: Object.fromEntries(Object.entries(VIDEO_FILES).map(([name, path]) => [name, fs.existsSync(path)])),
+      videosExist: Object.fromEntries(
+        Object.entries(VIDEO_FILES).map(([name, path]) => [
+          name,
+          videoDurations[name] !== 300
+        ])
+      ),
       errorsUnderControl: consecutiveErrors < MAX_CONSECUTIVE_ERRORS,
       videoDurationsKnown: Object.keys(videoDurations).length > 0,
       recentSuccess: (Date.now() - performanceStats.lastSuccessTime) < 30000,
