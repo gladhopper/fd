@@ -2,37 +2,54 @@ const express = require('express');
 const ffmpeg = require('fluent-ffmpeg');
 const fs = require('fs');
 const { PassThrough } = require('stream');
+const path = require('path');
 
-// Configure FFmpeg paths
+// Use system-installed FFmpeg (from Dockerfile)
 ffmpeg.setFfmpegPath('/usr/bin/ffmpeg');
 ffmpeg.setFfprobePath('/usr/bin/ffprobe');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
+
+// IMPORTANT: point to repo file (bundled with Docker image)
 const VIDEO_PATH = '/app/s.mp4';
 
-// Debug file system at startup
+// ADD DEBUGGING BLOCK RIGHT HERE
 console.log('=== DEBUGGING FILE EXISTENCE ===');
 console.log('Current working directory:', process.cwd());
 console.log('VIDEO_PATH:', VIDEO_PATH);
+
 try {
+  // List ALL files in /app
   console.log('All files in /app:', fs.readdirSync('/app'));
+  
+  // Check if the exact file exists
   console.log('Does VIDEO_PATH exist?', fs.existsSync(VIDEO_PATH));
+  
+  // If it exists, show file stats
   if (fs.existsSync(VIDEO_PATH)) {
     const stats = fs.statSync(VIDEO_PATH);
     console.log('File size:', stats.size);
     console.log('File permissions:', stats.mode.toString(8));
   }
+  
+  // Check if s.mp4 exists anywhere in /app
   const allFiles = fs.readdirSync('/app', { recursive: true });
   const mp4Files = allFiles.filter(f => f.includes('.mp4'));
   console.log('All MP4 files found:', mp4Files);
+  
+  // Try to access the file directly
+  const testBuffer = fs.readFileSync(VIDEO_PATH, { flag: 'r' });
+  console.log('File can be read, first 100 bytes:', testBuffer.slice(0, 100));
+  
 } catch (error) {
   console.error('Error during file system check:', error);
 }
 console.log('=== END DEBUG ===');
 
-// Performance settings
-const FPS = 7; // Locked at 7 FPS
+// Performance settings - LOCKED AT 7 FPS
+const FPS = 7;
+const FRAME_INTERVAL = 1000 / FPS; // Exactly 142.857ms between frames
 const WIDTH = 160;
 const HEIGHT = 120;
 
@@ -40,9 +57,6 @@ let currentFrame = 0;
 let videoDuration = 0;
 let lastPixels = [];
 let isProcessing = false;
-let avgProcessingTime = 200;
-let retryCount = 0;
-const frameQueue = []; // Custom queue for frame tasks
 
 // CORS
 app.use((req, res, next) => {
@@ -74,102 +88,85 @@ const getVideoDuration = () => {
     console.log(`Video duration: ${videoDuration}s`);
     console.log(`Total frames: ${Math.floor(videoDuration * FPS)}`);
     console.log(`Resolution: ${WIDTH}x${HEIGHT}`);
+    console.log(`Locked FPS: ${FPS} (${FRAME_INTERVAL}ms interval)`);
   } catch (err) {
     console.error('Could not get video duration:', err);
     videoDuration = 60;
   }
 })();
 
-// Process a single frame
-const processFrame = ({ seekTime, frameNumber }, callback) => {
-  const frameStart = Date.now();
-  let pixelBuffer = Buffer.alloc(0);
-  const outputStream = new PassThrough();
+// Fixed interval frame processing - ALWAYS 7 FPS
+let frameTimer = null;
 
-  outputStream.on('data', chunk => {
-    pixelBuffer = Buffer.concat([pixelBuffer, chunk]);
-  });
-
-  outputStream.on('end', () => {
-    const pixels = [];
-    for (let i = 0; i < pixelBuffer.length; i += 3) {
-      pixels.push([pixelBuffer[i], pixelBuffer[i + 1], pixelBuffer[i + 2]]);
-    }
-    lastPixels = pixels;
-    currentFrame = (frameNumber + 1) % Math.floor(videoDuration * FPS);
-    const processingTime = Date.now() - frameStart;
-    avgProcessingTime = (avgProcessingTime * 0.9) + (processingTime * 0.1);
-    const actualFps = 1000 / processingTime;
-    console.log(`✅ Frame ${frameNumber}: ${processingTime}ms, Actual FPS: ${actualFps.toFixed(2)}, Avg: ${Math.round(avgProcessingTime)}ms`);
-    outputStream.destroy();
-    pixelBuffer = Buffer.alloc(0); // Reset buffer
-    retryCount = 0; // Reset retry count on success
-    callback();
-  });
-
-  // Check file access
-  try {
-    if (!fs.existsSync(VIDEO_PATH) || !fs.accessSync(VIDEO_PATH, fs.constants.R_OK)) {
-      console.error('Cannot access video file:', VIDEO_PATH);
-      callback(new Error('Video file inaccessible'));
+const startFixedFPSProcessing = () => {
+  const processFrame = () => {
+    if (isProcessing || !videoDuration) return;
+    
+    const frameStart = Date.now();
+    isProcessing = true;
+    const seekTime = currentFrame / FPS;
+    
+    let pixelBuffer = Buffer.alloc(0);
+    const outputStream = new PassThrough();
+    
+    outputStream.on('data', chunk => {
+      pixelBuffer = Buffer.concat([pixelBuffer, chunk]);
+    });
+    
+    outputStream.on('end', () => {
+      const pixels = [];
+      for (let i = 0; i < pixelBuffer.length; i += 3) {
+        pixels.push([pixelBuffer[i], pixelBuffer[i + 1], pixelBuffer[i + 2]]);
+      }
+      
+      lastPixels = pixels;
+      currentFrame = (currentFrame + 1) % Math.floor(videoDuration * FPS);
+      isProcessing = false;
+      
+      const processingTime = Date.now() - frameStart;
+      console.log(`✅ Frame ${currentFrame - 1}: ${processingTime}ms (locked ${FPS} FPS)`);
+    });
+    
+    // Add pre-FFmpeg check
+    if (!fs.existsSync(VIDEO_PATH)) {
+      console.error('❌ Video file missing at processing time:', VIDEO_PATH);
+      isProcessing = false;
       return;
     }
-  } catch (err) {
-    console.error('File access error:', err);
-    callback(err);
-    return;
-  }
-
-  ffmpeg(VIDEO_PATH)
-    .seekInput(seekTime)
-    .frames(1)
-    .size(`${WIDTH}x${HEIGHT}`)
-    .outputOptions(['-pix_fmt rgb24', '-preset ultrafast'])
-    .format('rawvideo')
-    .on('error', (err) => {
-      console.error('FFmpeg error:', err);
-      console.error('Failed seeking to:', seekTime);
-      console.error('Current frame:', frameNumber);
-      try {
-        const stats = fs.statSync(VIDEO_PATH);
-        console.error('File stats - size:', stats.size, 'modified:', stats.mtime);
-      } catch (statErr) {
-        console.error('Could not get file stats:', statErr);
-      }
-      outputStream.destroy();
-      callback(err);
-    })
-    .pipe(outputStream);
-};
-
-// Start frame processing at 7 FPS
-const startFrameProcessing = () => {
-  setInterval(() => {
-    if (!isProcessing && videoDuration) {
-      // Add new frame task to queue
-      frameQueue.push({ seekTime: currentFrame / FPS, frameNumber: currentFrame });
-    }
-
-    // Process next frame if not already processing
-    if (!isProcessing && frameQueue.length > 0) {
-      isProcessing = true;
-      const task = frameQueue.shift(); // Get next task
-      processFrame(task, (err) => {
-        isProcessing = false;
-        if (err) {
-          console.error('Frame processing error:', err);
-          const retryDelay = Math.min(1000, 100 * Math.pow(2, retryCount++));
-          console.log(`Retrying in ${retryDelay}ms`);
-          setTimeout(() => {
-            frameQueue.unshift(task); // Re-queue failed task
-          }, retryDelay);
+    
+    ffmpeg(VIDEO_PATH)
+      .seekInput(seekTime)
+      .frames(1)
+      .size(`${WIDTH}x${HEIGHT}`)
+      .outputOptions(['-pix_fmt rgb24', '-preset ultrafast'])
+      .format('rawvideo')
+      .on('error', (err) => {
+        console.error('FFmpeg error:', err);
+        console.error('Failed seeking to:', seekTime);
+        console.error('Video path being used:', VIDEO_PATH);
+        console.error('File exists check:', fs.existsSync(VIDEO_PATH));
+        console.error('Current frame:', currentFrame);
+        
+        // Additional debug info
+        try {
+          const stats = fs.statSync(VIDEO_PATH);
+          console.error('File stats - size:', stats.size, 'modified:', stats.mtime);
+        } catch (statErr) {
+          console.error('Could not get file stats:', statErr);
         }
-      });
-    }
-  }, 1000 / FPS); // 142.86ms for 7 FPS
+        
+        isProcessing = false;
+      })
+      .pipe(outputStream);
+  };
+  
+  // Use setInterval for EXACT timing - no adaptive delays
+  frameTimer = setInterval(processFrame, FRAME_INTERVAL);
+  console.log(`🔒 Started LOCKED ${FPS} FPS processing (${FRAME_INTERVAL}ms intervals)`);
 };
 
-setTimeout(startFrameProcessing, 1000);
+// Start processing after initialization
+setTimeout(startFixedFPSProcessing, 1000);
 
 // API endpoints
 app.get('/frame', (req, res) => {
@@ -188,12 +185,12 @@ app.get('/info', (req, res) => {
     timestamp: currentFrame / FPS,
     duration: videoDuration,
     fps: FPS,
+    frameInterval: FRAME_INTERVAL,
     width: WIDTH,
     height: HEIGHT,
     totalFrames: Math.floor(videoDuration * FPS),
     isProcessing,
-    avgProcessingTime: Math.round(avgProcessingTime),
-    queueLength: frameQueue.length
+    locked: true // Indicates FPS is locked
   });
 });
 
@@ -207,29 +204,40 @@ app.get('/debug', (req, res) => {
     currentFrame,
     videoDuration,
     isProcessing,
-    avgProcessingTime: Math.round(avgProcessingTime),
-    retryCount,
-    queueLength: frameQueue.length
+    fps: FPS,
+    frameInterval: FRAME_INTERVAL,
+    locked: true
   });
 });
 
 app.get('/', (req, res) => {
   res.json({
-    status: 'Video server running - Koyeb ready',
+    status: 'Video server running - Koyeb ready (LOCKED 7 FPS)',
     frame: currentFrame,
     timestamp: currentFrame / FPS,
     duration: videoDuration,
     resolution: `${WIDTH}x${HEIGHT}`,
     fps: FPS,
+    frameInterval: FRAME_INTERVAL,
     pixelsCount: lastPixels.length,
     isProcessing,
     fileExists: fs.existsSync(VIDEO_PATH),
-    queueLength: frameQueue.length
+    locked: true
   });
 });
 
-// Start server
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('Shutting down...');
+  if (frameTimer) {
+    clearInterval(frameTimer);
+  }
+  process.exit(0);
+});
+
+// Listen on Koyeb-assigned port
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Video pixel server running at http://0.0.0.0:${PORT}`);
   console.log(`Debug endpoint available at http://0.0.0.0:${PORT}/debug`);
+  console.log(`🔒 LOCKED at exactly ${FPS} FPS (${FRAME_INTERVAL}ms intervals)`);
 });
