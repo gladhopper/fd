@@ -14,257 +14,378 @@ const PORT = process.env.PORT || 8080;
 // IMPORTANT: point to repo file (bundled with Docker image)
 const VIDEO_PATH = '/app/s.mp4';
 
-// ADD DEBUGGING BLOCK RIGHT HERE
-console.log('=== DEBUGGING FILE EXISTENCE ===');
+// ENHANCED DEBUGGING BLOCK
+console.log('=== ENHANCED FILE SYSTEM CHECK ===');
 console.log('Current working directory:', process.cwd());
 console.log('VIDEO_PATH:', VIDEO_PATH);
 
 try {
-  // List ALL files in /app
+  // More comprehensive file system check
   console.log('All files in /app:', fs.readdirSync('/app'));
-  
-  // Check if the exact file exists
   console.log('Does VIDEO_PATH exist?', fs.existsSync(VIDEO_PATH));
   
-  // If it exists, show file stats
   if (fs.existsSync(VIDEO_PATH)) {
     const stats = fs.statSync(VIDEO_PATH);
-    console.log('File size:', stats.size);
+    console.log('File size:', stats.size, 'bytes');
     console.log('File permissions:', stats.mode.toString(8));
+    console.log('Is readable:', fs.constants.R_OK & stats.mode);
+    
+    // Test file integrity
+    try {
+      const testBuffer = fs.readFileSync(VIDEO_PATH, { flag: 'r', highWaterMark: 1024 });
+      console.log('File header (first 32 bytes):', testBuffer.slice(0, 32).toString('hex'));
+      console.log('✅ File is accessible and readable');
+    } catch (readErr) {
+      console.error('❌ File read test failed:', readErr.message);
+    }
   }
   
-  // Check if s.mp4 exists anywhere in /app
-  const allFiles = fs.readdirSync('/app', { recursive: true });
-  const mp4Files = allFiles.filter(f => f.includes('.mp4'));
-  console.log('All MP4 files found:', mp4Files);
-  
-  // Try to access the file directly
-  const testBuffer = fs.readFileSync(VIDEO_PATH, { flag: 'r' });
-  console.log('File can be read, first 100 bytes:', testBuffer.slice(0, 100));
+  // Check for alternative file locations
+  const alternatives = ['/app/s.mp4', './s.mp4', 's.mp4'];
+  alternatives.forEach(alt => {
+    if (fs.existsSync(alt)) {
+      console.log(`Found alternative at: ${alt}`);
+    }
+  });
   
 } catch (error) {
-  console.error('Error during file system check:', error);
+  console.error('❌ Critical file system error:', error);
 }
-console.log('=== END DEBUG ===');
+console.log('=== END ENHANCED DEBUG ===');
 
-// STABLE RESOLUTION - Using 160x120 for reliability, will work towards 240p
-const FPS = 10;
-const FRAME_INTERVAL = 1000 / FPS; // 100ms exactly
-const WIDTH = 160;   // Stable resolution first
-const HEIGHT = 120;  // Then we can increase
+// ADAPTIVE QUALITY SETTINGS - Start conservative, scale up based on performance
+const QUALITY_PROFILES = {
+  low: { width: 160, height: 120, fps: 8, preset: 'ultrafast' },
+  medium: { width: 240, height: 180, fps: 10, preset: 'veryfast' },
+  high: { width: 320, height: 240, fps: 12, preset: 'fast' },
+  ultra: { width: 480, height: 360, fps: 15, preset: 'medium' }
+};
 
-// SYNCHRONIZED VIDEO PLAYBACK - all servers get same timestamp
-const VIDEO_START_OFFSET = parseFloat(process.env.VIDEO_START_OFFSET || 0); // Offset in seconds
-let videoStartTime = Date.now() - (VIDEO_START_OFFSET * 1000); // Adjust start time by offset
+let currentProfile = 'medium'; // Start with medium quality
+let { width: WIDTH, height: HEIGHT, fps: FPS, preset: PRESET } = QUALITY_PROFILES[currentProfile];
 
+const FRAME_INTERVAL = 1000 / FPS;
+const MAX_CONSECUTIVE_ERRORS = 5;
+const QUALITY_ADJUSTMENT_THRESHOLD = 10; // Adjust quality after N errors
+
+// ENHANCED SYNCHRONIZATION
+const VIDEO_START_OFFSET = parseFloat(process.env.VIDEO_START_OFFSET || 0);
+let videoStartTime = Date.now() - (VIDEO_START_OFFSET * 1000);
 let videoDuration = 0;
 let lastPixels = [];
 let consecutiveErrors = 0;
 let totalFramesProcessed = 0;
 let totalErrors = 0;
+let lastProcessingTimes = [];
+let qualityAdjustmentTimer = 0;
 
-// CORS
+// PERFORMANCE MONITORING
+const performanceStats = {
+  avgProcessingTime: 0,
+  successRate: 0,
+  lastSuccessTime: 0
+};
+
+// CORS with enhanced headers
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
   next();
 });
 
-// Get video duration
+// ROBUST video duration detection with fallbacks
 const getVideoDuration = () => {
   return new Promise((resolve) => {
-    console.log('Getting video duration for:', VIDEO_PATH);
+    console.log('🔍 Analyzing video file:', VIDEO_PATH);
+    
+    if (!fs.existsSync(VIDEO_PATH)) {
+      console.error('❌ Video file not found, using fallback duration');
+      resolve(300); // 5 minute fallback
+      return;
+    }
+    
+    const timeoutId = setTimeout(() => {
+      console.warn('⚠️ ffprobe timeout, using fallback');
+      resolve(300);
+    }, 10000); // 10 second timeout
+    
     ffmpeg.ffprobe(VIDEO_PATH, (err, metadata) => {
+      clearTimeout(timeoutId);
+      
       if (err) {
-        console.warn('ffprobe failed:', err);
+        console.warn('⚠️ ffprobe failed:', err.message);
         console.warn('Using fallback duration');
-        resolve(60);
+        resolve(300);
       } else {
-        console.log('ffprobe successful, duration:', metadata.format.duration);
-        resolve(metadata.format.duration);
+        const duration = metadata.format.duration || 300;
+        console.log('✅ Video analysis complete:');
+        console.log(`   Duration: ${duration}s (${Math.floor(duration/60)}:${Math.floor(duration%60).toString().padStart(2,'0')})`);
+        console.log(`   Codec: ${metadata.streams[0]?.codec_name || 'unknown'}`);
+        console.log(`   Resolution: ${metadata.streams[0]?.width || 'unknown'}x${metadata.streams[0]?.height || 'unknown'}`);
+        resolve(duration);
       }
     });
   });
 };
 
-// Initialize duration
-(async () => {
-  try {
-    videoDuration = await getVideoDuration();
-    console.log(`Video duration: ${videoDuration}s`);
-    console.log(`Total frames: ${Math.floor(videoDuration * FPS)}`);
-    console.log(`Resolution: ${WIDTH}x${HEIGHT} (stable mode)`);
-    console.log(`Synchronized playback: ${FPS} FPS`);
-    if (VIDEO_START_OFFSET > 0) {
-      console.log(`🕒 Video starts at offset: ${VIDEO_START_OFFSET}s (${Math.floor(VIDEO_START_OFFSET/60)}:${Math.floor(VIDEO_START_OFFSET%60).toString().padStart(2,'0')})`);
-    }
-  } catch (err) {
-    console.error('Could not get video duration:', err);
-    videoDuration = 60;
-  }
-})();
-
-// Calculate current synchronized timestamp
-const getCurrentVideoTime = () => {
-  if (!videoDuration) return 0;
+// ADAPTIVE QUALITY MANAGEMENT
+const adjustQuality = (direction) => {
+  const profiles = Object.keys(QUALITY_PROFILES);
+  const currentIndex = profiles.indexOf(currentProfile);
   
-  const elapsed = (Date.now() - videoStartTime) / 1000; // seconds since start
-  const loopedTime = elapsed % videoDuration; // loop the video
-  return Math.max(0, loopedTime);
+  if (direction === 'down' && currentIndex > 0) {
+    currentProfile = profiles[currentIndex - 1];
+    console.log(`📉 Quality downgraded to: ${currentProfile}`);
+  } else if (direction === 'up' && currentIndex < profiles.length - 1) {
+    currentProfile = profiles[currentIndex + 1];
+    console.log(`📈 Quality upgraded to: ${currentProfile}`);
+  }
+  
+  const profile = QUALITY_PROFILES[currentProfile];
+  WIDTH = profile.width;
+  HEIGHT = profile.height;
+  FPS = profile.fps;
+  PRESET = profile.preset;
+  
+  console.log(`🎥 New settings: ${WIDTH}x${HEIGHT} @ ${FPS}fps (${PRESET})`);
 };
 
-const getCurrentFrameNumber = () => {
-  const videoTime = getCurrentVideoTime();
-  return Math.floor(videoTime * FPS);
-};
-
-// SIMPLIFIED frame processing with better error recovery
+// ENHANCED frame processing with better error handling and quality optimization
 const processSingleFrame = async (targetTime) => {
   return new Promise((resolve) => {
-    console.log(`🎬 Processing frame at ${targetTime.toFixed(2)}s`);
+    console.log(`🎬 Processing frame at ${targetTime.toFixed(2)}s (${currentProfile})`);
     
+    const startTime = Date.now();
     let pixelBuffer = Buffer.alloc(0);
-    const outputStream = new PassThrough();
+    let outputStream = null;
     let streamEnded = false;
     let ffmpegInstance = null;
     
-    // Shorter timeout for faster recovery
+    // Adaptive timeout based on quality
+    const timeout = currentProfile === 'ultra' ? 3000 : 
+                   currentProfile === 'high' ? 2500 : 2000;
+    
     const streamTimeout = setTimeout(() => {
       if (!streamEnded) {
-        console.log(`⚠️ Frame timeout at ${targetTime.toFixed(2)}s`);
-        streamEnded = true;
-        if (outputStream && !outputStream.destroyed) {
-          outputStream.destroy();
-        }
-        if (ffmpegInstance) {
-          try {
-            // Use the correct fluent-ffmpeg kill method
-            ffmpegInstance.kill('SIGTERM');
-          } catch (e) {
-            // Ignore kill errors
-          }
-        }
+        console.log(`⏰ Frame timeout at ${targetTime.toFixed(2)}s (${timeout}ms)`);
+        cleanup();
         resolve(null);
       }
-    }, 1500); // 1.5 second timeout
+    }, timeout);
     
-    outputStream.on('data', chunk => {
-      if (!streamEnded) {
-        pixelBuffer = Buffer.concat([pixelBuffer, chunk]);
+    const cleanup = () => {
+      if (streamEnded) return;
+      streamEnded = true;
+      clearTimeout(streamTimeout);
+      
+      if (outputStream && !outputStream.destroyed) {
+        outputStream.destroy();
       }
-    });
-    
-    outputStream.on('end', () => {
-      if (!streamEnded) {
-        streamEnded = true;
-        clearTimeout(streamTimeout);
-        
-        const pixels = [];
-        for (let i = 0; i < pixelBuffer.length; i += 3) {
-          pixels.push([pixelBuffer[i], pixelBuffer[i + 1], pixelBuffer[i + 2]]);
+      
+      if (ffmpegInstance) {
+        try {
+          ffmpegInstance.kill('SIGTERM');
+        } catch (e) {
+          // Ignore kill errors
         }
-        
-        console.log(`✅ Frame at ${targetTime.toFixed(2)}s: ${pixels.length} pixels`);
-        resolve(pixels);
       }
-    });
+    };
     
-    outputStream.on('error', (err) => {
-      if (!streamEnded) {
-        streamEnded = true;
-        clearTimeout(streamTimeout);
+    try {
+      // Pre-flight checks
+      if (!fs.existsSync(VIDEO_PATH)) {
+        console.error('❌ Video file missing during processing');
+        cleanup();
+        resolve(null);
+        return;
+      }
+      
+      outputStream = new PassThrough();
+      
+      outputStream.on('data', chunk => {
+        if (!streamEnded) {
+          pixelBuffer = Buffer.concat([pixelBuffer, chunk]);
+        }
+      });
+      
+      outputStream.on('end', () => {
+        if (streamEnded) return;
+        cleanup();
+        
+        const processingTime = Date.now() - startTime;
+        
+        try {
+          // Enhanced pixel processing with validation
+          const expectedSize = WIDTH * HEIGHT * 3;
+          if (pixelBuffer.length !== expectedSize) {
+            console.warn(`⚠️ Buffer size mismatch: got ${pixelBuffer.length}, expected ${expectedSize}`);
+          }
+          
+          const pixels = [];
+          for (let i = 0; i < Math.min(pixelBuffer.length, expectedSize); i += 3) {
+            // Add bounds checking
+            if (i + 2 < pixelBuffer.length) {
+              pixels.push([
+                pixelBuffer[i] || 0,
+                pixelBuffer[i + 1] || 0,
+                pixelBuffer[i + 2] || 0
+              ]);
+            }
+          }
+          
+          console.log(`✅ Frame at ${targetTime.toFixed(2)}s: ${pixels.length} pixels (${processingTime}ms)`);
+          
+          // Track performance
+          lastProcessingTimes.push(processingTime);
+          if (lastProcessingTimes.length > 10) {
+            lastProcessingTimes.shift();
+          }
+          
+          resolve(pixels);
+          
+        } catch (pixelError) {
+          console.error('❌ Pixel processing error:', pixelError.message);
+          resolve(null);
+        }
+      });
+      
+      outputStream.on('error', (err) => {
+        cleanup();
         console.error(`❌ Stream error at ${targetTime.toFixed(2)}s:`, err.message);
         resolve(null);
-      }
-    });
-    
-    // Pre-check file existence
-    if (!fs.existsSync(VIDEO_PATH)) {
-      console.error('❌ Video file missing');
-      clearTimeout(streamTimeout);
-      resolve(null);
-      return;
-    }
-    
-    // Create FFmpeg process with ultra-conservative settings
-    try {
+      });
+      
+      // ENHANCED FFmpeg configuration with better stability
       ffmpegInstance = ffmpeg(VIDEO_PATH)
-        .seekInput(targetTime)
+        .seekInput(Math.max(0, targetTime))
         .frames(1)
         .size(`${WIDTH}x${HEIGHT}`)
         .outputOptions([
           '-pix_fmt rgb24',
-          '-preset ultrafast',
+          `-preset ${PRESET}`,
           '-tune fastdecode',
-          '-threads 1',
+          '-threads 2', // Slightly more threads for better performance
           '-avoid_negative_ts make_zero',
-          '-fflags +genpts'
+          '-fflags +genpts+discardcorrupt', // Handle corrupt frames better
+          '-err_detect ignore_err', // Continue on minor errors
+          '-f rawvideo'
         ])
         .format('rawvideo')
-        .on('start', () => {
-          // Optional: could log start
+        .on('start', (cmd) => {
+          // Optional: log FFmpeg command for debugging
+          // console.log('FFmpeg command:', cmd);
         })
         .on('error', (err) => {
-          if (!streamEnded) {
-            streamEnded = true;
-            clearTimeout(streamTimeout);
-            console.error(`❌ FFmpeg error at ${targetTime.toFixed(2)}s:`, err.message.split('\n')[0]);
-            resolve(null);
-          }
+          cleanup();
+          console.error(`❌ FFmpeg error at ${targetTime.toFixed(2)}s:`, err.message.split('\n')[0]);
+          resolve(null);
         })
-        .on('end', () => {
-          // Process ended normally
+        .on('stderr', (stderrLine) => {
+          // Only log critical errors
+          if (stderrLine.includes('error') || stderrLine.includes('failed')) {
+            console.warn('FFmpeg stderr:', stderrLine);
+          }
         });
       
-      ffmpegInstance.pipe(outputStream);
+      ffmpegInstance.pipe(outputStream, { end: true });
       
     } catch (err) {
-      streamEnded = true;
-      clearTimeout(streamTimeout);
+      cleanup();
       console.error('❌ Failed to create FFmpeg process:', err.message);
       resolve(null);
     }
   });
 };
 
-// Background processing with smart error recovery
+// Initialize duration and start processing
+(async () => {
+  try {
+    videoDuration = await getVideoDuration();
+    console.log(`🎥 Video ready: ${videoDuration}s duration`);
+    console.log(`📊 Total frames available: ${Math.floor(videoDuration * FPS)}`);
+    console.log(`🎯 Starting quality: ${currentProfile} (${WIDTH}x${HEIGHT} @ ${FPS}fps)`);
+    
+    if (VIDEO_START_OFFSET > 0) {
+      console.log(`⏩ Video offset: ${VIDEO_START_OFFSET}s`);
+    }
+    
+    // Start processing loop
+    startProcessingLoop();
+    
+  } catch (err) {
+    console.error('❌ Initialization failed:', err);
+    videoDuration = 300;
+    startProcessingLoop();
+  }
+})();
+
+// Calculate synchronized video time
+const getCurrentVideoTime = () => {
+  if (!videoDuration) return 0;
+  const elapsed = (Date.now() - videoStartTime) / 1000;
+  return Math.max(0, elapsed % videoDuration);
+};
+
+const getCurrentFrameNumber = () => {
+  return Math.floor(getCurrentVideoTime() * FPS);
+};
+
+// INTELLIGENT processing loop with adaptive quality
 let isProcessing = false;
 let lastSuccessfulTime = -1;
 
 const processFrameLoop = async () => {
-  if (!videoDuration) return;
+  if (!videoDuration || isProcessing) return;
   
-  // Skip if too many consecutive errors
-  if (consecutiveErrors > 3) {
-    console.log(`⏸️ Pausing for ${consecutiveErrors * 2} seconds due to errors`);
-    await new Promise(resolve => setTimeout(resolve, consecutiveErrors * 2000));
-    consecutiveErrors = Math.max(0, consecutiveErrors - 1);
+  // Smart error recovery with quality adjustment
+  if (consecutiveErrors > QUALITY_ADJUSTMENT_THRESHOLD) {
+    adjustQuality('down');
+    consecutiveErrors = Math.floor(consecutiveErrors / 2); // Reduce error count after downgrade
+  }
+  
+  // Pause on too many errors
+  if (consecutiveErrors > MAX_CONSECUTIVE_ERRORS) {
+    const pauseTime = Math.min(consecutiveErrors * 1000, 8000);
+    console.log(`⏸️ Pausing for ${pauseTime/1000}s due to errors`);
+    await new Promise(resolve => setTimeout(resolve, pauseTime));
+    consecutiveErrors = Math.max(0, consecutiveErrors - 2);
     return;
   }
   
-  if (isProcessing) return;
   isProcessing = true;
-  
   const currentTime = getCurrentVideoTime();
   
-  // Only process new frames
-  if (Math.abs(currentTime - lastSuccessfulTime) < 0.05) {
+  // Skip duplicate frames
+  if (Math.abs(currentTime - lastSuccessfulTime) < (1 / FPS / 2)) {
     isProcessing = false;
     return;
   }
   
-  const startTime = Date.now();
   const pixels = await processSingleFrame(currentTime);
-  const processingTime = Date.now() - startTime;
   
   if (pixels && pixels.length > 0) {
     lastPixels = pixels;
     lastSuccessfulTime = currentTime;
     consecutiveErrors = 0;
     totalFramesProcessed++;
+    performanceStats.lastSuccessTime = Date.now();
     
-    if (processingTime > 500) {
-      console.log(`⚠️ Slow processing: ${processingTime}ms`);
+    // Calculate success rate
+    performanceStats.successRate = totalFramesProcessed / (totalFramesProcessed + totalErrors);
+    
+    // Calculate average processing time
+    if (lastProcessingTimes.length > 0) {
+      performanceStats.avgProcessingTime = lastProcessingTimes.reduce((a, b) => a + b, 0) / lastProcessingTimes.length;
     }
+    
+    // Consider quality upgrade if performance is good
+    qualityAdjustmentTimer++;
+    if (qualityAdjustmentTimer > 50 && performanceStats.avgProcessingTime < 500 && consecutiveErrors === 0) {
+      adjustQuality('up');
+      qualityAdjustmentTimer = 0;
+    }
+    
   } else {
     consecutiveErrors++;
     totalErrors++;
@@ -274,11 +395,12 @@ const processFrameLoop = async () => {
   isProcessing = false;
 };
 
-// Start the processing loop
-setInterval(processFrameLoop, FRAME_INTERVAL);
-console.log(`🚀 Started stable video processing at ${FPS} FPS`);
+const startProcessingLoop = () => {
+  setInterval(processFrameLoop, FRAME_INTERVAL);
+  console.log(`🚀 Enhanced video processing started at ${FPS} FPS`);
+};
 
-// API endpoints with synchronized data
+// ENHANCED API endpoints
 app.get('/frame', (req, res) => {
   const currentTime = getCurrentVideoTime();
   const currentFrame = getCurrentFrameNumber();
@@ -292,112 +414,124 @@ app.get('/frame', (req, res) => {
     serverTime: Date.now(),
     videoStartTime: videoStartTime,
     synchronized: true,
+    quality: currentProfile,
     stats: {
       totalFrames: totalFramesProcessed,
       totalErrors: totalErrors,
-      consecutiveErrors: consecutiveErrors
+      consecutiveErrors: consecutiveErrors,
+      successRate: Math.round(performanceStats.successRate * 100) / 100,
+      avgProcessingTime: Math.round(performanceStats.avgProcessingTime)
     }
   });
 });
 
 app.get('/sync', (req, res) => {
-  const currentTime = getCurrentVideoTime();
-  const currentFrame = getCurrentFrameNumber();
-  
   res.json({
-    currentTime: currentTime,
-    currentFrame: currentFrame,
+    currentTime: getCurrentVideoTime(),
+    currentFrame: getCurrentFrameNumber(),
     serverTime: Date.now(),
     videoStartTime: videoStartTime,
     videoDuration: videoDuration,
     fps: FPS,
-    synchronized: true
+    synchronized: true,
+    quality: currentProfile,
+    resolution: `${WIDTH}x${HEIGHT}`
   });
 });
 
 app.get('/info', (req, res) => {
-  const currentTime = getCurrentVideoTime();
-  const currentFrame = getCurrentFrameNumber();
-  
   res.json({
-    currentFrame: currentFrame,
-    timestamp: currentTime,
+    status: 'Enhanced Adaptive Video Server',
+    currentFrame: getCurrentFrameNumber(),
+    timestamp: getCurrentVideoTime(),
     duration: videoDuration,
     fps: FPS,
-    frameInterval: FRAME_INTERVAL,
-    width: WIDTH,
-    height: HEIGHT,
+    quality: currentProfile,
+    resolution: `${WIDTH}x${HEIGHT}`,
     totalFrames: Math.floor(videoDuration * FPS),
     isProcessing,
     consecutiveErrors,
-    videoStartTime: videoStartTime,
-    serverTime: Date.now(),
-    synchronized: true,
-    stable: true,
-    stats: {
-      totalFrames: totalFramesProcessed,
-      totalErrors: totalErrors,
-      uptime: Math.floor((Date.now() - videoStartTime) / 1000)
-    }
+    performance: performanceStats,
+    availableQualities: Object.keys(QUALITY_PROFILES)
   });
 });
 
+app.get('/quality/:profile', (req, res) => {
+  const profile = req.params.profile;
+  if (QUALITY_PROFILES[profile]) {
+    currentProfile = profile;
+    const settings = QUALITY_PROFILES[profile];
+    WIDTH = settings.width;
+    HEIGHT = settings.height;
+    FPS = settings.fps;
+    PRESET = settings.preset;
+    
+    console.log(`🎛️ Quality manually set to: ${currentProfile}`);
+    res.json({ success: true, quality: currentProfile, settings });
+  } else {
+    res.status(400).json({ error: 'Invalid quality profile', available: Object.keys(QUALITY_PROFILES) });
+  }
+});
+
 app.get('/debug', (req, res) => {
-  const currentTime = getCurrentVideoTime();
-  const currentFrame = getCurrentFrameNumber();
-  
   res.json({
     videoPath: VIDEO_PATH,
     fileExists: fs.existsSync(VIDEO_PATH),
-    workingDirectory: process.cwd(),
-    filesInApp: fs.readdirSync('/app'),
-    fileStats: fs.existsSync(VIDEO_PATH) ? fs.statSync(VIDEO_PATH) : null,
-    currentFrame: currentFrame,
-    currentTime: currentTime,
+    fileSize: fs.existsSync(VIDEO_PATH) ? fs.statSync(VIDEO_PATH).size : null,
+    currentFrame: getCurrentFrameNumber(),
+    currentTime: getCurrentVideoTime(),
     videoDuration,
-    isProcessing,
-    fps: FPS,
-    frameInterval: FRAME_INTERVAL,
-    consecutiveErrors,
+    quality: currentProfile,
     resolution: `${WIDTH}x${HEIGHT}`,
-    videoStartTime: videoStartTime,
-    serverTime: Date.now(),
-    synchronized: true,
-    stable: true
+    fps: FPS,
+    preset: PRESET,
+    performance: performanceStats,
+    lastProcessingTimes,
+    consecutiveErrors,
+    totalErrors,
+    isProcessing,
+    pixelsCount: lastPixels.length
   });
 });
 
 app.get('/', (req, res) => {
-  const currentTime = getCurrentVideoTime();
-  const currentFrame = getCurrentFrameNumber();
-  
   res.json({
-    status: 'STABLE Synchronized Video Server - 160x120 @ 10 FPS',
-    frame: currentFrame,
-    timestamp: currentTime,
+    status: `Enhanced Adaptive Video Server - ${currentProfile.toUpperCase()}`,
+    frame: getCurrentFrameNumber(),
+    timestamp: getCurrentVideoTime(),
     duration: videoDuration,
+    quality: currentProfile,
     resolution: `${WIDTH}x${HEIGHT}`,
     fps: FPS,
-    frameInterval: FRAME_INTERVAL,
     pixelsCount: lastPixels.length,
-    isProcessing,
-    consecutiveErrors,
-    fileExists: fs.existsSync(VIDEO_PATH),
-    videoStartTime: videoStartTime,
-    serverTime: Date.now(),
+    performance: performanceStats,
     synchronized: true,
-    stable: true
+    enhanced: true
   });
 });
 
-// Listen on Koyeb-assigned port
+// Health check endpoint
+app.get('/health', (req, res) => {
+  const isHealthy = fs.existsSync(VIDEO_PATH) && 
+                   consecutiveErrors < MAX_CONSECUTIVE_ERRORS &&
+                   videoDuration > 0;
+  
+  res.status(isHealthy ? 200 : 503).json({
+    status: isHealthy ? 'healthy' : 'unhealthy',
+    checks: {
+      fileExists: fs.existsSync(VIDEO_PATH),
+      errorsUnderControl: consecutiveErrors < MAX_CONSECUTIVE_ERRORS,
+      videoDurationKnown: videoDuration > 0,
+      recentSuccess: (Date.now() - performanceStats.lastSuccessTime) < 30000
+    }
+  });
+});
+
+// Start server
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`STABLE Synchronized Video Server running at http://0.0.0.0:${PORT}`);
-  console.log(`Debug endpoint available at http://0.0.0.0:${PORT}/debug`);
-  console.log(`Sync endpoint available at http://0.0.0.0:${PORT}/sync`);
-  console.log(`🔒 STABLE mode: ${WIDTH}x${HEIGHT} at ${FPS} FPS`);
-  console.log(`🕒 Video start time: ${new Date(videoStartTime).toISOString()}`);
-  if (VIDEO_START_OFFSET > 0) {
-    console.log(`⏩ Starting with ${VIDEO_START_OFFSET}s offset`);
-  }
+  console.log(`🌟 Enhanced Video Server running at http://0.0.0.0:${PORT}`);
+  console.log(`🎥 Adaptive Quality: ${currentProfile} (${WIDTH}x${HEIGHT} @ ${FPS}fps)`);
+  console.log(`📊 Health check: http://0.0.0.0:${PORT}/health`);
+  console.log(`🎛️ Quality control: http://0.0.0.0:${PORT}/quality/{low|medium|high|ultra}`);
+  console.log(`🔍 Debug info: http://0.0.0.0:${PORT}/debug`);
 });
