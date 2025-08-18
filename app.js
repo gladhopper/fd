@@ -10,10 +10,10 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const VIDEO_PATH = '/app/s.mp4';
 
-// Optimized settings
+// Higher resolution settings
 const FPS = 6;
-const WIDTH = 160;
-const HEIGHT = 120;
+const WIDTH = 192;
+const HEIGHT = 144;
 
 let currentFrame = 0;
 let videoDuration = 0;
@@ -56,8 +56,8 @@ const getVideoDuration = () => {
 (async () => {
   try {
     videoDuration = await getVideoDuration();
-    console.log(`🎬 Video loaded: ${videoDuration}s duration, ${FPS} FPS, ${WIDTH}x${HEIGHT}`);
-    console.log(`📊 Expected frames: ${Math.floor(videoDuration * FPS)}`);
+    console.log(`🎬 Video loaded: ${videoDuration}s duration, ${FPS} FPS, ${WIDTH}x${HEIGHT} (HIGH-RES)`);
+    console.log(`📊 Expected frames: ${Math.floor(videoDuration * FPS)}, Pixels per frame: ${WIDTH * HEIGHT}`);
   } catch (err) {
     console.error('Duration initialization failed:', err);
     videoDuration = 60;
@@ -109,9 +109,9 @@ const startRobustProcessing = () => {
       isProcessing = false;
       
       // Exponential backoff on timeouts
-      const delay = Math.min(5000, 1000 * Math.pow(1.5, consecutiveErrors));
+      const delay = Math.min(3000, 500 * Math.pow(1.2, consecutiveErrors));
       setTimeout(processFrame, delay);
-    }, 8000); // 8 second timeout
+    }, 5000); // Reduced to 5 second timeout
     
     let pixelBuffer = Buffer.alloc(0);
     const outputStream = new PassThrough();
@@ -194,9 +194,12 @@ const startRobustProcessing = () => {
           '-pix_fmt rgb24',
           '-preset ultrafast',
           '-tune fastdecode',
-          '-threads 1', // Use single thread to reduce resource contention
+          '-threads 1',
           '-avoid_negative_ts make_zero',
-          '-fflags +genpts'
+          '-fflags +genpts',
+          '-copyts',
+          '-start_at_zero',
+          '-vsync 0'  // Disable video sync to prevent stream issues
         ])
         .format('rawvideo')
         .on('start', (commandLine) => {
@@ -222,9 +225,9 @@ const startRobustProcessing = () => {
           const delay = Math.min(5000, 200 * Math.pow(1.5, consecutiveErrors));
           
           // If too many consecutive errors, try skipping ahead
-          if (consecutiveErrors >= 5) {
+          if (consecutiveErrors >= 3) {  // Reduced from 5 to 3
             console.warn('🔄 Too many errors, skipping ahead...');
-            currentFrame = (currentFrame + 5) % Math.floor(videoDuration * FPS);
+            currentFrame = (currentFrame + 2) % Math.floor(videoDuration * FPS);  // Skip less frames
             consecutiveErrors = 0;
           }
           
@@ -300,7 +303,7 @@ app.get('/health', (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({
-    status: '🛡️ Robust Video Server Running',
+    status: '🛡️ Robust High-Res Video Server',
     frame: currentFrame,
     timestamp: currentFrame / FPS,
     duration: videoDuration,
