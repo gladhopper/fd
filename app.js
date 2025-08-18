@@ -24,7 +24,7 @@ const HEIGHT = 120;
 const FPS = 10;
 const PRESET = 'veryfast';
 const FRAME_INTERVAL = 1000 / FPS;
-const TIMEOUT_MS = 5000; // Increased timeout for stability
+const TIMEOUT_MS = 5000;
 
 // Video state
 let videoStartTime = Date.now();
@@ -45,7 +45,7 @@ let ffmpegInstance = null;
 // Validate and get video duration
 async function getVideoDuration(videoPath) {
   try {
-    await fs.access(videoPath); // Check if file exists
+    await fs.access(videoPath);
     return new Promise((resolve) => {
       ffmpeg.ffprobe(videoPath, (err, metadata) => {
         if (err) {
@@ -121,7 +121,7 @@ const processSingleFrame = async (targetTime, videoName) => {
       try {
         await fs.access(videoPath);
         outputStream.on('data', chunk => {
-          if (!streamEnded) pixelBuffer = Buffer.concat([pixelBuffer, chunk]);
+          if (!streamEnded) pixelBuffer = Buffer.concat([buffer, chunk]);
         });
 
         outputStream.on('end', () => {
@@ -160,7 +160,7 @@ const processSingleFrame = async (targetTime, videoName) => {
         });
 
         ffmpegInstance = ffmpeg(videoPath)
-          .seekInput(Math.max(0, targetTime))
+          .inputOptions([`-re`, `-seek ${Math.max(0, targetTime)}`]) // Fixed: -re and -ss as input options
           .frames(1)
           .size(`${WIDTH}x${HEIGHT}`)
           .outputOptions([
@@ -168,7 +168,6 @@ const processSingleFrame = async (targetTime, videoName) => {
             `-preset ${PRESET}`,
             '-tune fastdecode',
             '-threads 1',
-            '-re',
             '-avoid_negative_ts make_zero',
             '-fflags +genpts+discardcorrupt',
             '-f rawvideo'
@@ -194,7 +193,14 @@ const processSingleFrame = async (targetTime, videoName) => {
 // Handle SIGTERM
 process.on('SIGTERM', () => {
   console.log('🛑 Received SIGTERM, cleaning up...');
-  if (ffmpegInstance) ffmpegInstance.kill('SIGTERM');
+  if (ffmpegInstance) {
+    try {
+      ffmpegInstance.kill('SIGTERM');
+    } catch (e) {
+      console.error('Error killing FFmpeg:', e.message);
+    }
+    ffmpegInstance = null;
+  }
   process.exit(0);
 });
 
