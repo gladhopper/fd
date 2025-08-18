@@ -47,21 +47,21 @@ try {
 }
 console.log('=== END DEBUG ===');
 
-// 240p resolution (192x144) with synchronized playback
+// STABLE RESOLUTION - Using 160x120 for reliability, will work towards 240p
 const FPS = 10;
 const FRAME_INTERVAL = 1000 / FPS; // 100ms exactly
-const WIDTH = 192;   // 240p width
-const HEIGHT = 144;  // 240p height
+const WIDTH = 160;   // Stable resolution first
+const HEIGHT = 120;  // Then we can increase
+
+// SYNCHRONIZED VIDEO PLAYBACK - all servers get same timestamp
+const VIDEO_START_OFFSET = parseFloat(process.env.VIDEO_START_OFFSET || 0); // Offset in seconds
+let videoStartTime = Date.now() - (VIDEO_START_OFFSET * 1000); // Adjust start time by offset
 
 let videoDuration = 0;
 let lastPixels = [];
-let isProcessing = false;
 let consecutiveErrors = 0;
-
-// SYNCHRONIZED VIDEO PLAYBACK - all servers get same timestamp
-let videoStartTime = Date.now(); // When the video conceptually "started"
-let lastFrameCache = null;
-let cacheTimestamp = 0;
+let totalFramesProcessed = 0;
+let totalErrors = 0;
 
 // CORS
 app.use((req, res, next) => {
@@ -92,8 +92,11 @@ const getVideoDuration = () => {
     videoDuration = await getVideoDuration();
     console.log(`Video duration: ${videoDuration}s`);
     console.log(`Total frames: ${Math.floor(videoDuration * FPS)}`);
-    console.log(`Resolution: ${WIDTH}x${HEIGHT} (240p)`);
+    console.log(`Resolution: ${WIDTH}x${HEIGHT} (stable mode)`);
     console.log(`Synchronized playback: ${FPS} FPS`);
+    if (VIDEO_START_OFFSET > 0) {
+      console.log(`🕒 Video starts at offset: ${VIDEO_START_OFFSET}s (${Math.floor(VIDEO_START_OFFSET/60)}:${Math.floor(VIDEO_START_OFFSET%60).toString().padStart(2,'0')})`);
+    }
   } catch (err) {
     console.error('Could not get video duration:', err);
     videoDuration = 60;
@@ -106,7 +109,7 @@ const getCurrentVideoTime = () => {
   
   const elapsed = (Date.now() - videoStartTime) / 1000; // seconds since start
   const loopedTime = elapsed % videoDuration; // loop the video
-  return loopedTime;
+  return Math.max(0, loopedTime);
 };
 
 const getCurrentFrameNumber = () => {
@@ -114,153 +117,166 @@ const getCurrentFrameNumber = () => {
   return Math.floor(videoTime * FPS);
 };
 
-// Frame processing for synchronized playback
-let activeFFmpegProcess = null;
-let lastProcessedFrame = -1;
-
-const processSynchronizedFrame = async (targetTime) => {
-  if (isProcessing || consecutiveErrors > 5) {
-    if (consecutiveErrors > 5) {
-      console.log(`⏸️ Pausing due to ${consecutiveErrors} consecutive errors`);
-      setTimeout(() => { consecutiveErrors = 0; }, 5000);
-    }
-    return null;
-  }
-  
+// SIMPLIFIED frame processing with better error recovery
+const processSingleFrame = async (targetTime) => {
   return new Promise((resolve) => {
-    const frameStart = Date.now();
-    isProcessing = true;
+    console.log(`🎬 Processing frame at ${targetTime.toFixed(2)}s`);
     
     let pixelBuffer = Buffer.alloc(0);
     const outputStream = new PassThrough();
+    let streamEnded = false;
+    let ffmpegInstance = null;
     
-    // Set up timeout for the stream
+    // Shorter timeout for faster recovery
     const streamTimeout = setTimeout(() => {
-      console.log('⚠️ Stream timeout, destroying stream');
-      try {
+      if (!streamEnded) {
+        console.log(`⚠️ Frame timeout at ${targetTime.toFixed(2)}s`);
+        streamEnded = true;
         if (outputStream && !outputStream.destroyed) {
           outputStream.destroy();
         }
-        if (activeFFmpegProcess) {
-          // Use the fluent-ffmpeg kill method
-          activeFFmpegProcess.kill();
+        if (ffmpegInstance) {
+          try {
+            // Use the correct fluent-ffmpeg kill method
+            ffmpegInstance.kill('SIGTERM');
+          } catch (e) {
+            // Ignore kill errors
+          }
         }
-      } catch (err) {
-        console.log('Error during timeout cleanup:', err.message);
+        resolve(null);
       }
-      consecutiveErrors++;
-      isProcessing = false;
-      activeFFmpegProcess = null;
-      resolve(null);
-    }, 2500); // Reduced to 2.5 seconds
+    }, 1500); // 1.5 second timeout
     
     outputStream.on('data', chunk => {
-      pixelBuffer = Buffer.concat([pixelBuffer, chunk]);
+      if (!streamEnded) {
+        pixelBuffer = Buffer.concat([pixelBuffer, chunk]);
+      }
     });
     
     outputStream.on('end', () => {
-      clearTimeout(streamTimeout);
-      
-      const pixels = [];
-      for (let i = 0; i < pixelBuffer.length; i += 3) {
-        pixels.push([pixelBuffer[i], pixelBuffer[i + 1], pixelBuffer[i + 2]]);
+      if (!streamEnded) {
+        streamEnded = true;
+        clearTimeout(streamTimeout);
+        
+        const pixels = [];
+        for (let i = 0; i < pixelBuffer.length; i += 3) {
+          pixels.push([pixelBuffer[i], pixelBuffer[i + 1], pixelBuffer[i + 2]]);
+        }
+        
+        console.log(`✅ Frame at ${targetTime.toFixed(2)}s: ${pixels.length} pixels`);
+        resolve(pixels);
       }
-      
-      consecutiveErrors = 0; // Reset error counter on success
-      isProcessing = false;
-      
-      const processingTime = Date.now() - frameStart;
-      if (processingTime > 200) {
-        console.log(`⚠️ Slow frame at ${targetTime.toFixed(2)}s: ${processingTime}ms`);
-      } else {
-        console.log(`✅ Frame at ${targetTime.toFixed(2)}s: ${processingTime}ms`);
-      }
-      
-      resolve(pixels);
     });
     
     outputStream.on('error', (err) => {
-      clearTimeout(streamTimeout);
-      console.error('Stream error:', err.message);
-      consecutiveErrors++;
-      isProcessing = false;
-      resolve(null);
+      if (!streamEnded) {
+        streamEnded = true;
+        clearTimeout(streamTimeout);
+        console.error(`❌ Stream error at ${targetTime.toFixed(2)}s:`, err.message);
+        resolve(null);
+      }
     });
     
-    // Pre-FFmpeg checks
+    // Pre-check file existence
     if (!fs.existsSync(VIDEO_PATH)) {
-      console.error('❌ Video file missing at processing time:', VIDEO_PATH);
-      consecutiveErrors++;
-      isProcessing = false;
+      console.error('❌ Video file missing');
       clearTimeout(streamTimeout);
       resolve(null);
       return;
     }
     
-    // Create FFmpeg process with optimized settings for 240p
-    activeFFmpegProcess = ffmpeg(VIDEO_PATH)
-      .seekInput(targetTime)
-      .frames(1)
-      .size(`${WIDTH}x${HEIGHT}`)
-      .outputOptions([
-        '-pix_fmt rgb24',
-        '-preset ultrafast',
-        '-tune fastdecode',
-        '-threads 2', // Slightly more threads for 240p
-        '-avoid_negative_ts make_zero'
-      ])
-      .format('rawvideo')
-      .on('error', (err) => {
-        clearTimeout(streamTimeout);
-        
-        if (err.message.includes('Output stream closed')) {
-          console.error(`⚠️ Stream closed error at ${targetTime.toFixed(2)}s`);
-        } else {
-          console.error('FFmpeg error:', err.message);
-        }
-        
-        consecutiveErrors++;
-        isProcessing = false;
-        activeFFmpegProcess = null;
-        resolve(null);
-      })
-      .on('end', () => {
-        activeFFmpegProcess = null;
-      })
-      .pipe(outputStream);
+    // Create FFmpeg process with ultra-conservative settings
+    try {
+      ffmpegInstance = ffmpeg(VIDEO_PATH)
+        .seekInput(targetTime)
+        .frames(1)
+        .size(`${WIDTH}x${HEIGHT}`)
+        .outputOptions([
+          '-pix_fmt rgb24',
+          '-preset ultrafast',
+          '-tune fastdecode',
+          '-threads 1',
+          '-avoid_negative_ts make_zero',
+          '-fflags +genpts'
+        ])
+        .format('rawvideo')
+        .on('start', () => {
+          // Optional: could log start
+        })
+        .on('error', (err) => {
+          if (!streamEnded) {
+            streamEnded = true;
+            clearTimeout(streamTimeout);
+            console.error(`❌ FFmpeg error at ${targetTime.toFixed(2)}s:`, err.message.split('\n')[0]);
+            resolve(null);
+          }
+        })
+        .on('end', () => {
+          // Process ended normally
+        });
+      
+      ffmpegInstance.pipe(outputStream);
+      
+    } catch (err) {
+      streamEnded = true;
+      clearTimeout(streamTimeout);
+      console.error('❌ Failed to create FFmpeg process:', err.message);
+      resolve(null);
+    }
   });
 };
 
-// Background frame processing
-const startSynchronizedProcessing = () => {
-  setInterval(async () => {
-    if (!videoDuration) return;
+// Background processing with smart error recovery
+let isProcessing = false;
+let lastSuccessfulTime = -1;
+
+const processFrameLoop = async () => {
+  if (!videoDuration) return;
+  
+  // Skip if too many consecutive errors
+  if (consecutiveErrors > 3) {
+    console.log(`⏸️ Pausing for ${consecutiveErrors * 2} seconds due to errors`);
+    await new Promise(resolve => setTimeout(resolve, consecutiveErrors * 2000));
+    consecutiveErrors = Math.max(0, consecutiveErrors - 1);
+    return;
+  }
+  
+  if (isProcessing) return;
+  isProcessing = true;
+  
+  const currentTime = getCurrentVideoTime();
+  
+  // Only process new frames
+  if (Math.abs(currentTime - lastSuccessfulTime) < 0.05) {
+    isProcessing = false;
+    return;
+  }
+  
+  const startTime = Date.now();
+  const pixels = await processSingleFrame(currentTime);
+  const processingTime = Date.now() - startTime;
+  
+  if (pixels && pixels.length > 0) {
+    lastPixels = pixels;
+    lastSuccessfulTime = currentTime;
+    consecutiveErrors = 0;
+    totalFramesProcessed++;
     
-    const currentTime = getCurrentVideoTime();
-    const currentFrame = getCurrentFrameNumber();
-    
-    // Only process if we need a new frame
-    if (currentFrame === lastProcessedFrame) return;
-    
-    const pixels = await processSynchronizedFrame(currentTime);
-    if (pixels) {
-      lastPixels = pixels;
-      lastFrameCache = {
-        pixels: pixels,
-        frame: currentFrame,
-        timestamp: currentTime,
-        serverTime: Date.now(),
-        width: WIDTH,
-        height: HEIGHT
-      };
-      cacheTimestamp = Date.now();
-      lastProcessedFrame = currentFrame;
+    if (processingTime > 500) {
+      console.log(`⚠️ Slow processing: ${processingTime}ms`);
     }
-  }, FRAME_INTERVAL / 2); // Check twice per frame for better sync
+  } else {
+    consecutiveErrors++;
+    totalErrors++;
+    console.log(`❌ Failed frame (${consecutiveErrors} consecutive errors)`);
+  }
+  
+  isProcessing = false;
 };
 
-// Start processing after initialization
-setTimeout(startSynchronizedProcessing, 1000);
+// Start the processing loop
+setInterval(processFrameLoop, FRAME_INTERVAL);
+console.log(`🚀 Started stable video processing at ${FPS} FPS`);
 
 // API endpoints with synchronized data
 app.get('/frame', (req, res) => {
@@ -275,7 +291,12 @@ app.get('/frame', (req, res) => {
     height: HEIGHT,
     serverTime: Date.now(),
     videoStartTime: videoStartTime,
-    synchronized: true
+    synchronized: true,
+    stats: {
+      totalFrames: totalFramesProcessed,
+      totalErrors: totalErrors,
+      consecutiveErrors: consecutiveErrors
+    }
   });
 });
 
@@ -311,7 +332,13 @@ app.get('/info', (req, res) => {
     consecutiveErrors,
     videoStartTime: videoStartTime,
     serverTime: Date.now(),
-    synchronized: true
+    synchronized: true,
+    stable: true,
+    stats: {
+      totalFrames: totalFramesProcessed,
+      totalErrors: totalErrors,
+      uptime: Math.floor((Date.now() - videoStartTime) / 1000)
+    }
   });
 });
 
@@ -335,7 +362,8 @@ app.get('/debug', (req, res) => {
     resolution: `${WIDTH}x${HEIGHT}`,
     videoStartTime: videoStartTime,
     serverTime: Date.now(),
-    synchronized: true
+    synchronized: true,
+    stable: true
   });
 });
 
@@ -344,7 +372,7 @@ app.get('/', (req, res) => {
   const currentFrame = getCurrentFrameNumber();
   
   res.json({
-    status: 'Synchronized Video Server - 240p @ 10 FPS',
+    status: 'STABLE Synchronized Video Server - 160x120 @ 10 FPS',
     frame: currentFrame,
     timestamp: currentTime,
     duration: videoDuration,
@@ -357,41 +385,19 @@ app.get('/', (req, res) => {
     fileExists: fs.existsSync(VIDEO_PATH),
     videoStartTime: videoStartTime,
     serverTime: Date.now(),
-    synchronized: true
+    synchronized: true,
+    stable: true
   });
-});
-
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('Shutting down gracefully...');
-  try {
-    if (activeFFmpegProcess) {
-      activeFFmpegProcess.kill();
-    }
-  } catch (err) {
-    console.log('Error during shutdown:', err.message);
-  }
-  process.exit(0);
-});
-
-process.on('SIGINT', () => {
-  console.log('Shutting down gracefully...');
-  try {
-    if (activeFFmpegProcess) {
-      activeFFmpegProcess.kill();
-    }
-  } catch (err) {
-    console.log('Error during shutdown:', err.message);
-  }
-  process.exit(0);
 });
 
 // Listen on Koyeb-assigned port
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Synchronized Video Server running at http://0.0.0.0:${PORT}`);
+  console.log(`STABLE Synchronized Video Server running at http://0.0.0.0:${PORT}`);
   console.log(`Debug endpoint available at http://0.0.0.0:${PORT}/debug`);
   console.log(`Sync endpoint available at http://0.0.0.0:${PORT}/sync`);
-  console.log(`🎬 SYNCHRONIZED playback at ${FPS} FPS`);
-  console.log(`📐 240p resolution: ${WIDTH}x${HEIGHT}`);
+  console.log(`🔒 STABLE mode: ${WIDTH}x${HEIGHT} at ${FPS} FPS`);
   console.log(`🕒 Video start time: ${new Date(videoStartTime).toISOString()}`);
+  if (VIDEO_START_OFFSET > 0) {
+    console.log(`⏩ Starting with ${VIDEO_START_OFFSET}s offset`);
+  }
 });
