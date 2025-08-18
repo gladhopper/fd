@@ -4,7 +4,7 @@ const fs = require('fs').promises;
 const path = require('path');
 const { PassThrough } = require('stream');
 
-// Set FFmpeg paths (Koyeb container should have FFmpeg installed)
+// Set FFmpeg paths
 ffmpeg.setFfmpegPath('/usr/bin/ffmpeg');
 ffmpeg.setFfprobePath('/usr/bin/ffprobe');
 
@@ -13,27 +13,18 @@ const PORT = process.env.PORT || 8000;
 
 // Video file paths
 const VIDEO_FILES = {
-  'video.mp4': '/app/video.mp4',
-  's.mp4': '/app/s.mp4'
+  's.mp4': '/app/s.mp4',
+  'video.mp4': '/app/video.mp4'
 };
-
-// Default video
 const DEFAULT_VIDEO = 's.mp4';
 
-// Quality profiles (start with low to reduce resource usage)
-const QUALITY_PROFILES = {
-  low: { width: 160, height: 120, fps: 8, preset: 'ultrafast' },
-  medium: { width: 160, height: 120, fps: 10, preset: 'veryfast' },
-  high: { width: 160, height: 120, fps: 12, preset: 'fast' },
-  ultra: { width: 160, height: 120, fps: 15, preset: 'medium' }
-};
-
-let currentProfile = 'low';
-let { width: WIDTH, height: HEIGHT, fps: FPS, preset: PRESET } = QUALITY_PROFILES[currentProfile];
-let FRAME_INTERVAL = 1000 / FPS;
-
-const MAX_CONSECUTIVE_ERRORS = 5;
-const QUALITY_ADJUSTMENT_THRESHOLD = 5;
+// Fixed quality settings
+const WIDTH = 160;
+const HEIGHT = 120;
+const FPS = 10;
+const PRESET = 'veryfast';
+const FRAME_INTERVAL = 1000 / FPS;
+const TIMEOUT_MS = 5000; // Increased timeout for stability
 
 // Video state
 let videoStartTime = Date.now();
@@ -47,8 +38,7 @@ let performanceStats = {
   avgProcessingTime: 0,
   successRate: 0,
   lastSuccessTime: 0,
-  memoryUsage: null,
-  cpuUsage: null
+  memoryUsage: null
 };
 let ffmpegInstance = null;
 
@@ -90,44 +80,23 @@ async function getVideoDuration(videoPath) {
   }
 })();
 
-// Adaptive quality management
-const adjustQuality = (direction) => {
-  const profiles = Object.keys(QUALITY_PROFILES);
-  const currentIndex = profiles.indexOf(currentProfile);
-  if (direction === 'down' && currentIndex > 0) {
-    currentProfile = profiles[currentIndex - 1];
-    console.log(`📉 Quality downgraded to: ${currentProfile}`);
-  } else if (direction === 'up' && currentIndex < profiles.length - 1) {
-    currentProfile = profiles[currentIndex + 1];
-    console.log(`📈 Quality upgraded to: ${currentProfile}`);
-  }
-  const profile = QUALITY_PROFILES[currentProfile];
-  WIDTH = profile.width;
-  HEIGHT = profile.height;
-  FPS = profile.fps;
-  PRESET = profile.preset;
-  FRAME_INTERVAL = 1000 / FPS;
-  console.log(`🎥 New settings: ${WIDTH}x${HEIGHT} @ ${FPS}fps (${PRESET})`);
-};
-
 // Process single frame
 const processSingleFrame = async (targetTime, videoName) => {
   const videoPath = VIDEO_FILES[videoName] || VIDEO_FILES[DEFAULT_VIDEO];
   return new Promise((resolve) => {
-    console.log(`🎬 Processing frame at ${targetTime.toFixed(2)}s (${currentProfile}, ${videoName})`);
+    console.log(`🎬 Processing frame at ${targetTime.toFixed(2)}s (${videoName})`);
     const startTime = Date.now();
     let pixelBuffer = Buffer.alloc(0);
     let outputStream = new PassThrough();
     let streamEnded = false;
 
-    const timeout = 3000; // Unified timeout to prevent FFmpeg errors
     const streamTimeout = setTimeout(() => {
       if (!streamEnded) {
-        console.log(`⏰ Frame timeout at ${targetTime.toFixed(2)}s (${timeout}ms)`);
+        console.log(`⏰ Frame timeout at ${targetTime.toFixed(2)}s (${TIMEOUT_MS}ms)`);
         cleanup();
         resolve(null);
       }
-    }, timeout);
+    }, TIMEOUT_MS);
 
     const cleanup = () => {
       if (streamEnded) return;
@@ -155,9 +124,7 @@ const processSingleFrame = async (targetTime, videoName) => {
       }
 
       outputStream.on('data', chunk => {
-        if (!streamEnded) {
-          pixelBuffer = Buffer.concat([pixelBuffer, chunk]);
-        }
+        if (!streamEnded) pixelBuffer = Buffer.concat([pixelBuffer, chunk]);
       });
 
       outputStream.on('end', () => {
@@ -181,12 +148,10 @@ const processSingleFrame = async (targetTime, videoName) => {
           }
           console.log(`✅ Frame at ${targetTime.toFixed(2)}s: ${pixels.length} pixels (${processingTime}ms)`);
           lastProcessingTimes.push(processingTime);
-          if (lastProcessingTimes.length > 10) {
-            lastProcessingTimes.shift();
-          }
+          if (lastProcessingTimes.length > 10) lastProcessingTimes.shift();
           resolve(pixels);
-        } catch (pixelError) {
-          console.error('❌ Pixel processing error:', pixelError.message);
+        } catch (err) {
+          console.error('❌ Pixel processing error:', err.message);
           resolve(null);
         }
       });
@@ -206,28 +171,20 @@ const processSingleFrame = async (targetTime, videoName) => {
           `-preset ${PRESET}`,
           '-tune fastdecode',
           '-threads 1',
-          '-re', // Real-time processing
+          '-re',
           '-avoid_negative_ts make_zero',
           '-fflags +genpts+discardcorrupt',
           '-f rawvideo'
         ])
         .format('rawvideo')
-        .on('start', (cmd) => {
-          console.log('FFmpeg command:', cmd);
-        })
+        .on('start', (cmd) => console.log('FFmpeg command:', cmd))
         .on('error', (err, stdout, stderr) => {
           cleanup();
           console.error(`❌ FFmpeg error at ${targetTime.toFixed(2)}s:`, err.message);
           console.error('FFmpeg stderr:', stderr);
           resolve(null);
         })
-        .on('stderr', (stderrLine) => {
-          if (stderrLine.includes('error') || stderrLine.includes('failed')) {
-            console.warn('FFmpeg stderr:', stderrLine);
-          }
-        });
-
-      ffmpegInstance.pipe(outputStream, { end: true });
+        .pipe(outputStream, { end: true });
     } catch (err) {
       cleanup();
       console.error('❌ Failed to create FFmpeg process:', err.message);
@@ -239,37 +196,27 @@ const processSingleFrame = async (targetTime, videoName) => {
 // Handle SIGTERM
 process.on('SIGTERM', () => {
   console.log('🛑 Received SIGTERM, cleaning up...');
-  if (ffmpegInstance) {
-    ffmpegInstance.kill('SIGTERM');
-  }
+  if (ffmpegInstance) ffmpegInstance.kill('SIGTERM');
   process.exit(0);
-});
-
-// CORS headers
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type');
-  next();
 });
 
 // Processing loop
 let isProcessing = false;
 let lastSuccessfulTime = -1;
+const MAX_CONSECUTIVE_ERRORS = 5;
 
 const processFrameLoop = async () => {
   if (!videoDurations[DEFAULT_VIDEO] || isProcessing) return;
   performanceStats.memoryUsage = process.memoryUsage();
   if (performanceStats.memoryUsage.heapUsed > 150 * 1024 * 1024) {
-    adjustQuality('down');
-    console.log('📉 Downgraded due to high memory usage');
+    console.log('⚠️ High memory usage detected, pausing for 6s');
+    await new Promise(resolve => setTimeout(resolve, 6000));
+    return;
   }
   if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-    adjustQuality('down');
     consecutiveErrors = 0;
-    const pauseTime = 5000;
-    console.log(`⏸️ Pausing for ${pauseTime/1000}s due to errors`);
-    await new Promise(resolve => setTimeout(resolve, pauseTime));
+    console.log(`⏸️ Pausing for 6s due to errors`);
+    await new Promise(resolve => setTimeout(resolve, 6000));
     return;
   }
   isProcessing = true;
@@ -299,6 +246,13 @@ const processFrameLoop = async () => {
 
 setInterval(processFrameLoop, FRAME_INTERVAL);
 
+// CORS headers
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  next();
+});
+
 // Endpoints
 app.get('/frame', async (req, res) => {
   const videoName = req.query.video || DEFAULT_VIDEO;
@@ -313,8 +267,7 @@ app.get('/frame', async (req, res) => {
     height: HEIGHT,
     serverTime: Date.now(),
     videoStartTime,
-    synchronized: true,
-    quality: currentProfile
+    synchronized: true
   });
 });
 
@@ -329,7 +282,6 @@ app.get('/sync', (req, res) => {
     videoDuration,
     fps: FPS,
     synchronized: true,
-    quality: currentProfile,
     resolution: `${WIDTH}x${HEIGHT}`
   });
 });
@@ -345,12 +297,13 @@ app.get('/health', (req, res) => {
       errorsUnderControl: consecutiveErrors < MAX_CONSECUTIVE_ERRORS,
       videoDurationsKnown: Object.keys(videoDurations).length > 0,
       recentSuccess: (Date.now() - performanceStats.lastSuccessTime) < 30000,
-      memoryUsage: process.memoryUsage(),
-      cpuUsage: process.cpuUsage()
+      memoryUsage: process.memoryUsage()
     }
   });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🌟 Video Server running at http://0.0.0.0:${PORT}`);
+  console.log(`🎥 Fixed Resolution: ${WIDTH}x${HEIGHT} @ ${FPS}fps`);
+  console.log(`📊 Health check: http://plastic-ardeen-fdsz-3c9c531a.koyeb.app/health`);
 });
