@@ -2,16 +2,13 @@ const express = require('express');
 const ffmpeg = require('fluent-ffmpeg');
 const fs = require('fs');
 const { PassThrough } = require('stream');
-const async = require('async');
 
-// Use system-installed FFmpeg (from Dockerfile)
+// Configure FFmpeg paths
 ffmpeg.setFfmpegPath('/usr/bin/ffmpeg');
 ffmpeg.setFfprobePath('/usr/bin/ffprobe');
 
 const app = express();
-const PORT = process.env.PORT || 8080;
-
-// Video file path (bundled with Docker image)
+const PORT = process.env.PORT || 3000;
 const VIDEO_PATH = '/app/s.mp4';
 
 // Debug file system at startup
@@ -45,6 +42,7 @@ let lastPixels = [];
 let isProcessing = false;
 let avgProcessingTime = 200;
 let retryCount = 0;
+const frameQueue = []; // Custom queue for frame tasks
 
 // CORS
 app.use((req, res, next) => {
@@ -82,9 +80,8 @@ const getVideoDuration = () => {
   }
 })();
 
-// Frame processing queue
-const frameQueue = async.queue((task, callback) => {
-  const { seekTime, frameNumber } = task;
+// Process a single frame
+const processFrame = ({ seekTime, frameNumber }, callback) => {
   const frameStart = Date.now();
   let pixelBuffer = Buffer.alloc(0);
   const outputStream = new PassThrough();
@@ -143,21 +140,28 @@ const frameQueue = async.queue((task, callback) => {
       callback(err);
     })
     .pipe(outputStream);
-}, 1); // Process one frame at a time
+};
 
 // Start frame processing at 7 FPS
 const startFrameProcessing = () => {
   setInterval(() => {
     if (!isProcessing && videoDuration) {
+      // Add new frame task to queue
+      frameQueue.push({ seekTime: currentFrame / FPS, frameNumber: currentFrame });
+    }
+
+    // Process next frame if not already processing
+    if (!isProcessing && frameQueue.length > 0) {
       isProcessing = true;
-      frameQueue.push({ seekTime: currentFrame / FPS, frameNumber: currentFrame }, (err) => {
+      const task = frameQueue.shift(); // Get next task
+      processFrame(task, (err) => {
         isProcessing = false;
         if (err) {
-          console.error('Queue error:', err);
+          console.error('Frame processing error:', err);
           const retryDelay = Math.min(1000, 100 * Math.pow(2, retryCount++));
           console.log(`Retrying in ${retryDelay}ms`);
           setTimeout(() => {
-            frameQueue.push({ seekTime: currentFrame / FPS, frameNumber: currentFrame });
+            frameQueue.unshift(task); // Re-queue failed task
           }, retryDelay);
         }
       });
@@ -188,7 +192,8 @@ app.get('/info', (req, res) => {
     height: HEIGHT,
     totalFrames: Math.floor(videoDuration * FPS),
     isProcessing,
-    avgProcessingTime: Math.round(avgProcessingTime)
+    avgProcessingTime: Math.round(avgProcessingTime),
+    queueLength: frameQueue.length
   });
 });
 
@@ -203,7 +208,8 @@ app.get('/debug', (req, res) => {
     videoDuration,
     isProcessing,
     avgProcessingTime: Math.round(avgProcessingTime),
-    retryCount
+    retryCount,
+    queueLength: frameQueue.length
   });
 });
 
@@ -217,7 +223,8 @@ app.get('/', (req, res) => {
     fps: FPS,
     pixelsCount: lastPixels.length,
     isProcessing,
-    fileExists: fs.existsSync(VIDEO_PATH)
+    fileExists: fs.existsSync(VIDEO_PATH),
+    queueLength: frameQueue.length
   });
 });
 
