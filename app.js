@@ -9,7 +9,7 @@ ffmpeg.setFfmpegPath('/usr/bin/ffmpeg');
 ffmpeg.setFfprobePath('/usr/bin/ffprobe');
 
 const app = express();
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 8000;
 
 // IMPORTANT: point to repo file (bundled with Docker image)
 const VIDEO_PATH = '/app/s.mp4';
@@ -53,15 +53,15 @@ try {
 }
 console.log('=== END ENHANCED DEBUG ===');
 
-// ADAPTIVE QUALITY SETTINGS - Start conservative, scale up based on performance
+// FIXED QUALITY SETTINGS - All output 160x120 for Roblox client compatibility
 const QUALITY_PROFILES = {
   low: { width: 160, height: 120, fps: 8, preset: 'ultrafast' },
-  medium: { width: 240, height: 180, fps: 10, preset: 'veryfast' },
-  high: { width: 320, height: 240, fps: 12, preset: 'fast' },
-  ultra: { width: 480, height: 360, fps: 15, preset: 'medium' }
+  medium: { width: 160, height: 120, fps: 10, preset: 'veryfast' },
+  high: { width: 160, height: 120, fps: 12, preset: 'fast' },
+  ultra: { width: 160, height: 120, fps: 15, preset: 'medium' }
 };
 
-let currentProfile = 'medium'; // Start with medium quality
+let currentProfile = 'low'; // Start with low quality to prevent timeouts
 let { width: WIDTH, height: HEIGHT, fps: FPS, preset: PRESET } = QUALITY_PROFILES[currentProfile];
 
 const FRAME_INTERVAL = 1000 / FPS;
@@ -162,9 +162,9 @@ const processSingleFrame = async (targetTime) => {
     let streamEnded = false;
     let ffmpegInstance = null;
     
-    // Adaptive timeout based on quality
-    const timeout = currentProfile === 'ultra' ? 3000 : 
-                   currentProfile === 'high' ? 2500 : 2000;
+    // Reduced timeout for 160x120 resolution
+    const timeout = currentProfile === 'ultra' ? 2000 : 
+                   currentProfile === 'high' ? 1500 : 1000;
     
     const streamTimeout = setTimeout(() => {
       if (!streamEnded) {
@@ -265,7 +265,7 @@ const processSingleFrame = async (targetTime) => {
           '-pix_fmt rgb24',
           `-preset ${PRESET}`,
           '-tune fastdecode',
-          '-threads 2', // Slightly more threads for better performance
+          '-threads 1', // Reduced threads for stability
           '-avoid_negative_ts make_zero',
           '-fflags +genpts+discardcorrupt', // Handle corrupt frames better
           '-err_detect ignore_err', // Continue on minor errors
@@ -381,7 +381,7 @@ const processFrameLoop = async () => {
     
     // Consider quality upgrade if performance is good
     qualityAdjustmentTimer++;
-    if (qualityAdjustmentTimer > 50 && performanceStats.avgProcessingTime < 500 && consecutiveErrors === 0) {
+    if (qualityAdjustmentTimer > 50 && performanceStats.avgProcessingTime < 300 && consecutiveErrors === 0) {
       adjustQuality('up');
       qualityAdjustmentTimer = 0;
     }
@@ -441,7 +441,7 @@ app.get('/sync', (req, res) => {
 
 app.get('/info', (req, res) => {
   res.json({
-    status: 'Enhanced Adaptive Video Server',
+    status: 'Enhanced Adaptive Video Server - ROBLOX OPTIMIZED',
     currentFrame: getCurrentFrameNumber(),
     timestamp: getCurrentVideoTime(),
     duration: videoDuration,
@@ -496,7 +496,7 @@ app.get('/debug', (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({
-    status: `Enhanced Adaptive Video Server - ${currentProfile.toUpperCase()}`,
+    status: `Enhanced Adaptive Video Server - ROBLOX OPTIMIZED - ${currentProfile.toUpperCase()}`,
     frame: getCurrentFrameNumber(),
     timestamp: getCurrentVideoTime(),
     duration: videoDuration,
@@ -506,7 +506,8 @@ app.get('/', (req, res) => {
     pixelsCount: lastPixels.length,
     performance: performanceStats,
     synchronized: true,
-    enhanced: true
+    enhanced: true,
+    robloxOptimized: true
   });
 });
 
@@ -529,9 +530,12 @@ app.get('/health', (req, res) => {
 
 // Start server
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🌟 Enhanced Video Server running at http://0.0.0.0:${PORT}`);
-  console.log(`🎥 Adaptive Quality: ${currentProfile} (${WIDTH}x${HEIGHT} @ ${FPS}fps)`);
+  console.log(`🌟 Enhanced Video Server (ROBLOX OPTIMIZED) running at http://0.0.0.0:${PORT}`);
+  console.log(`🎥 Fixed Resolution: ${WIDTH}x${HEIGHT} @ ${FPS}fps (${currentProfile})`);
   console.log(`📊 Health check: http://0.0.0.0:${PORT}/health`);
   console.log(`🎛️ Quality control: http://0.0.0.0:${PORT}/quality/{low|medium|high|ultra}`);
   console.log(`🔍 Debug info: http://0.0.0.0:${PORT}/debug`);
+  console.log(`🎮 Roblox Client URLs:`);
+  console.log(`   Frame: http://plastic-ardeen-fdsz-3c9c531a.koyeb.app:${PORT}/frame`);
+  console.log(`   Sync:  http://plastic-ardeen-fdsz-3c9c531a.koyeb.app:${PORT}/sync`);
 });
