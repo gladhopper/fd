@@ -10,11 +10,11 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const VIDEO_PATH = '/app/s.mp4';
 
-// Align resolution with client and set FPS
-const FPS = 6;
-const WIDTH = 192; // Match client’s BLOCK_WIDTH
-const HEIGHT = 144; // Match client’s BLOCK_HEIGHT
-const FRAME_INTERVAL = 1000 / FPS; // ~166.67ms
+// Configuration
+const FPS = 10; // Target 10 FPS
+const WIDTH = 320; // Higher resolution
+const HEIGHT = 240;
+const FRAME_INTERVAL = 1000 / FPS; // 100ms per frame
 
 let currentFrame = 0;
 let videoDuration = 0;
@@ -22,7 +22,7 @@ let lastPixels = [];
 let isProcessing = false;
 
 // Performance tracking
-let avgProcessingTime = 200;
+let avgProcessingTime = 100;
 let consecutiveErrors = 0;
 let totalFramesProcessed = 0;
 let lastSuccessfulFrame = 0;
@@ -113,7 +113,7 @@ const processFrame = async () => {
     isProcessing = false;
     currentFrame = (currentFrame + 1) % Math.floor(videoDuration * FPS);
     setTimeout(processFrame, FRAME_INTERVAL);
-  }, 2000);
+  }, 1500); // Shorter timeout for faster FPS
 
   let pixelBuffer = Buffer.alloc(0);
   const outputStream = new PassThrough();
@@ -148,7 +148,7 @@ const processFrame = async () => {
       const processingTime = Date.now() - frameStart;
       avgProcessingTime = (avgProcessingTime * 0.9) + (processingTime * 0.1);
 
-      if (totalFramesProcessed % 30 === 0) {
+      if (totalFramesProcessed % 50 === 0) {
         console.log(`✅ Frame ${lastSuccessfulFrame}: ${processingTime}ms (avg: ${Math.round(avgProcessingTime)}ms)`);
       }
 
@@ -192,8 +192,8 @@ const processFrame = async () => {
       .size(`${WIDTH}x${HEIGHT}`)
       .outputOptions([
         '-pix_fmt rgb24',
-        '-vf', `scale=${WIDTH}:${HEIGHT}:flags=fast_bilinear`, // Faster scaling
-        '-preset ultrafast', // Optimize for speed
+        '-vf', `scale=${WIDTH}:${HEIGHT}:flags=fast_bilinear`,
+        '-preset ultrafast',
         '-tune zerolatency',
         '-an',
         '-sn',
@@ -209,7 +209,7 @@ const processFrame = async () => {
 
 // Start processing
 setTimeout(() => {
-  console.log('🚀 Starting video processing at 6 FPS...');
+  console.log('🚀 Starting video processing at 10 FPS...');
   processFrame();
 }, 1000);
 
@@ -254,7 +254,7 @@ app.get('/info', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  const isHealthy = consecutiveErrors < 3 && avgProcessingTime < 1000 && fs.existsSync(VIDEO_PATH);
+  const isHealthy = consecutiveErrors < 3 && avgProcessingTime < 500 && fs.existsSync(VIDEO_PATH);
   res.status(isHealthy ? 200 : 503).json({
     status: isHealthy ? 'healthy' : 'degraded',
     avgProcessingTime: Math.round(avgProcessingTime),
