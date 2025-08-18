@@ -11,10 +11,10 @@ const PORT = process.env.PORT || 8080;
 const VIDEO_PATH = '/app/s.mp4';
 
 // Configuration
-const FPS = 10; // Target 10 FPS
-const WIDTH = 320; // Higher resolution
-const HEIGHT = 240;
-const FRAME_INTERVAL = 1000 / FPS; // 100ms per frame
+const FPS = 8; // Target 8 FPS
+const WIDTH = 208; // New resolution
+const HEIGHT = 156;
+const FRAME_INTERVAL = 1000 / FPS; // 125ms per frame
 
 let currentFrame = 0;
 let videoDuration = 0;
@@ -113,7 +113,7 @@ const processFrame = async () => {
     isProcessing = false;
     currentFrame = (currentFrame + 1) % Math.floor(videoDuration * FPS);
     setTimeout(processFrame, FRAME_INTERVAL);
-  }, 1500); // Shorter timeout for faster FPS
+  }, 1500);
 
   let pixelBuffer = Buffer.alloc(0);
   const outputStream = new PassThrough();
@@ -148,7 +148,7 @@ const processFrame = async () => {
       const processingTime = Date.now() - frameStart;
       avgProcessingTime = (avgProcessingTime * 0.9) + (processingTime * 0.1);
 
-      if (totalFramesProcessed % 50 === 0) {
+      if (totalFramesProcessed % 8 === 0) { // Log every 1s (8 frames)
         console.log(`✅ Frame ${lastSuccessfulFrame}: ${processingTime}ms (avg: ${Math.round(avgProcessingTime)}ms)`);
       }
 
@@ -209,7 +209,7 @@ const processFrame = async () => {
 
 // Start processing
 setTimeout(() => {
-  console.log('🚀 Starting video processing at 10 FPS...');
+  console.log('🚀 Starting video processing at 8 FPS, 208x156...');
   processFrame();
 }, 1000);
 
